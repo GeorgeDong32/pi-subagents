@@ -794,35 +794,10 @@ export class SubagentFleetStatus {
 			this.clearWorkflowCoverage();
 			return [];
 		}
-		if (!this.active) {
-			this.clearWorkflowCoverage();
-			const workEntries = this.entries.filter((entry) => !entry.surface);
-			const projectEntries = this.entries.filter((entry) => entry.surface === "project-pane");
-			// Workflow totals can overlap child usage and omit live lanes. Do not
-			// present either wrapper totals or an active-only sum as workflow spend.
-			const hasWorkflow = workEntries.some((entry) => entry.workflowWrapper);
-			const nativeEntries = workEntries.filter((entry) => !entry.external && !entry.workflowWrapper && !entry.parentKey);
-			const tokens = nativeEntries.reduce((total, entry) => total + entry.tokens, 0);
-			const window = nativeEntries.length > 0 && nativeEntries.every((entry) => entry.window !== undefined)
-				? nativeEntries.reduce((total, entry) => total + entry.window!, 0)
-				: undefined;
-			const capacity = this.state.activeAsyncCapacity;
-			const hasNativeRows = nativeEntries.length > 0 || hasWorkflow;
-			const showNativeSummary = hasNativeRows || Boolean(capacity?.used);
-			const asyncRuns = capacity && showNativeSummary && (capacity.used > 0 || capacity.limit > 0) ? `Async runs ${capacity.used}/${capacity.limit || "∞"}` : "";
-			const activeEntries = activeLeafAgentCount(workEntries);
-			const noun = workEntries.some((entry) => entry.external) ? "job" : "agent";
-			const agents = activeEntries > 0 ? `${activeEntries} active ${noun}${activeEntries === 1 ? "" : "s"}` : "";
-			const paneAttention = projectEntries.filter((entry) => entry.projectPane && projectPaneNeedsAttention(entry.projectPane)).length;
-			const panes = projectEntries.length > 0 ? `${projectEntries.length} pane${projectEntries.length === 1 ? "" : "s"}${paneAttention ? ` (${paneAttention} ⚠)` : ""}` : "";
-			const label = [agents, asyncRuns, panes].filter(Boolean).join(" · ");
-			const nativeUsage = formatFleetTokens(tokens, window, nativeEntries.length);
-			const usage = hasWorkflow
-				? nativeEntries.length > 0 ? `standalone: ${nativeUsage} · workflow usage on child rows` : "usage on child rows"
-				: nativeUsage;
-			const detail = [showNativeSummary ? usage : undefined, "↓/← to inspect"].filter(Boolean).join(" · ");
-			return [truncateToWidth(`  ${theme.fg("muted", label)}${label && detail ? " · " : ""}${theme.fg("dim", detail)}`, width)];
-		}
+		// Surface tuning (CC parity): the roster renders expanded by default —
+		// a flat agent list under a `● main` row. The `active` flag now only
+		// gates interactive selection (↓/← , jk, enter), so key handling is
+		// unchanged.
 		const roster = this.rosterKeys();
 		const selectedIndex = Math.max(0, roster.indexOf(this.selectedKey));
 		const rosterIndexByKey = new Map<string, number>();
