@@ -267,7 +267,7 @@ function traceSources(trace: readonly WorkflowChecklistTraceEntry[] | undefined)
 }
 
 function traceItem(entry: WorkflowChecklistTraceEntry, index: number, preflight: WorkflowPreflightLane | undefined): WorkflowChecklistItem {
-	const phase = keyText(preflight?.key ?? entry.generatedLaneKey ?? entry.phase, "Workflow");
+	const phase = keyText(preflight?.key ?? entry.generatedLaneKey ?? entry.phase, FALLBACK_PHASE_LABEL);
 	const item = stepItem({ key: entry.key, label: entry.label, phase, agent: entry.agent, status: entry.state === "started" ? "running" : entry.state, durationMs: entry.durationMs, error: entry.error }, index, phase, entry.key, entry.label ?? entry.key, preflight);
 	if (entry.operation === "host") item.kind = "host";
 	return item;
@@ -326,7 +326,7 @@ export function projectWorkflowChecklist(input: WorkflowChecklistInput): Workflo
 	const traceByKey = new Map(trace.map((entry) => [entry.key, entry]));
 	const phaseByNode = new Map<string, string>();
 	for (const phase of input.graph?.phases ?? []) {
-		const title = keyText(phase.title, "Workflow");
+		const title = keyText(phase.title, FALLBACK_PHASE_LABEL);
 		phaseFor(phases, title);
 		for (const nodeId of phase.nodeIds) if (!phaseByNode.has(nodeId)) phaseByNode.set(nodeId, title);
 	}
@@ -346,7 +346,7 @@ export function projectWorkflowChecklist(input: WorkflowChecklistInput): Workflo
 
 	for (const node of nodes) {
 		const host = node.hostStep ?? hostById.get(node.id);
-		const phase = keyText(phaseByNode.get(node.id) ?? node.phase ?? (host ? host.label : node.label), "Workflow");
+		const phase = keyText(phaseByNode.get(node.id) ?? node.phase ?? (host ? host.label : node.label), FALLBACK_PHASE_LABEL);
 		if (host) {
 			add(phases, phase, hostItem(host, phase, node.id));
 			hostById.delete(node.id);
@@ -368,7 +368,7 @@ export function projectWorkflowChecklist(input: WorkflowChecklistInput): Workflo
 		const key = keyText(stepKey(step), `step-${index + 1}`);
 		const traceEntry = traceByKey.get(key);
 		const lane = laneFor(input.preflight, key, [step.phase, traceEntry?.generatedLaneKey, traceEntry?.phase]);
-		const phase = keyText(lane?.key ?? step.phase ?? traceEntry?.generatedLaneKey ?? traceEntry?.phase, "Workflow");
+		const phase = keyText(lane?.key ?? step.phase ?? traceEntry?.generatedLaneKey ?? traceEntry?.phase, FALLBACK_PHASE_LABEL);
 		add(phases, phase, applyNow(stepItem(step, index, phase, key, step.label ?? step.key ?? step.agent, lane), input.now));
 	}
 
@@ -399,9 +399,17 @@ export function formatWorkflowChecklistSummary(projection: WorkflowChecklistProj
 	return [`${projection.done}/${projection.total} done`, projection.running ? `${projection.running} active` : undefined, projection.queued ? `${projection.queued} queued` : undefined, projection.blocked ? `${projection.blocked} blocked` : undefined, projection.failed ? `${projection.failed} failed` : undefined, projection.paused ? `${projection.paused} paused` : undefined, projection.stopped ? `${projection.stopped} stopped` : undefined].filter((value): value is string => Boolean(value)).join(" · ");
 }
 
+// Surface tuning: unnamed workflow phases group under this label instead of
+// the misleading default "Workflow" (which read as "Workflow 2 active").
+const FALLBACK_PHASE_LABEL = "Tasks";
+
 export function formatWorkflowChecklistPhase(phase: WorkflowChecklistPhase): string {
-	const counts = [phase.total > 1 && phase.done ? `${phase.done} done` : undefined, phase.running ? `${phase.running} active` : undefined, phase.queued ? `${phase.queued} queued` : undefined, phase.blocked ? `${phase.blocked} blocked` : undefined, phase.failed ? `${phase.failed} failed` : undefined, phase.paused ? `${phase.paused} paused` : undefined, phase.stopped ? `${phase.stopped} stopped` : undefined].filter((value): value is string => Boolean(value));
-	return counts.length ? `${phase.label} ${counts.join(" · ")}` : phase.label;
+	// Surface tuning: "· " separates the phase name from its counts, and the
+	// running count reads "running" (not "active"); a lone single-task count
+	// collapses to the bare state word ("Phase 2 · running").
+	const counts = [phase.total > 1 && phase.done ? `${phase.done} done` : undefined, phase.running ? `${phase.running === 1 ? "" : `${phase.running} `}running` : undefined, phase.queued ? `${phase.queued} queued` : undefined, phase.blocked ? `${phase.blocked} blocked` : undefined, phase.failed ? `${phase.failed} failed` : undefined, phase.paused ? `${phase.paused} paused` : undefined, phase.stopped ? `${phase.stopped} stopped` : undefined].filter((value): value is string => Boolean(value));
+	if (counts.length === 1 && counts[0] === "running") return `${phase.label} · running`;
+	return counts.length ? `${phase.label} · ${counts.join(" · ")}` : phase.label;
 }
 
 export function formatWorkflowChecklistBottleneck(item: WorkflowChecklistItem | undefined, options: { includeOutput?: boolean; includeError?: boolean } = {}): string | undefined {
