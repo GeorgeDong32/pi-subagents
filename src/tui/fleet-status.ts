@@ -734,6 +734,14 @@ export class SubagentFleetStatus {
 			if (this.active) this.deactivate();
 			return undefined;
 		}
+		if (!this.active) {
+			const activates = matchesKey(data, "down") || matchesKey(data, "left");
+			if (!activates || ctx.ui.getEditorText() !== "") return undefined;
+			this.active = true;
+			this.selectedKey = "main";
+			this.refresh();
+			return { consume: true };
+		}
 
 		// Surface tuning (CC parity): the roster renders expanded by default —
 		// a flat agent list under a `● main` row. The `active` flag now only
