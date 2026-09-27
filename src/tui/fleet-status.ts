@@ -54,6 +54,7 @@ type FleetStatusTui = {
 };
 type FleetStatusEntry = {
 	runLabel?: string;
+	workflowKey?: string;
 	key: string;
 	surface?: "project-pane";
 	parentKey?: string;
@@ -501,6 +502,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 				...(modelThinking ? { modelThinking } : {}),
 				description: step.description ?? job.description,
 				...(job.label && !step.label ? { runLabel: job.label } : {}),
+				...(job.workflowKey ? { workflowKey: job.workflowKey } : {}),
 				startedAt: step.startedAt ?? startedAt,
 				tokens: step.tokens?.total ?? (steps.length === 1 ? job.totalTokens?.total ?? 0 : 0),
 				...((step.tokens?.window ?? (steps.length === 1 ? job.totalTokens?.window : undefined)) !== undefined
@@ -872,7 +874,7 @@ export class SubagentFleetStatus {
 		// Label = explicit displayLabel, else the run's task text (truncated).
 		// Redacted placeholders are skipped — containment strips task text
 		// from runner events, and "[prompt redacted]" is noise in a headline.
-		let label = String(entry.displayLabel ?? entry.runLabel ?? entry.description ?? "").replace(/\s+/g, " ").trim();
+		let label = String(entry.displayLabel ?? entry.runLabel ?? entry.workflowKey ?? entry.description ?? "").replace(/\s+/g, " ").trim();
 		if (label === "[prompt redacted]") label = "";
 		if (label.length > 20) label = `${label.slice(0, 19)}…`;
 		if (!label || label === type) label = "";
