@@ -188,6 +188,7 @@ interface AsyncExecutionContext {
 export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
 
 interface AsyncChainParams {
+	label?: string;
 	chain: ChainStep[];
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -252,6 +253,7 @@ interface AsyncChainParams {
 }
 
 interface AsyncSingleParams {
+	label?: string;
 	agent: string;
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -1637,6 +1639,7 @@ export function executeAsyncChain(
 			agents: flatAgents,
 			task: firstTask?.trim() ? PROMPT_REDACTED : undefined,
 			goal: workflowGoal?.trim() ? PROMPT_REDACTED : undefined,
+			...(typeof params.label === "string" && params.label.trim() ? { label: params.label.trim() } : {}),
 			chain: eventChain.map((s) =>
 				isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : isDynamicParallelStep(s) ? `expand:${s.parallel.agent}` : (s as SequentialStep).agent,
 			),
@@ -2210,6 +2213,7 @@ export function executeAsyncSingle(
 			agent,
 			task: task?.trim() ? PROMPT_REDACTED : undefined,
 			goal: (params.goal ?? task).trim() ? PROMPT_REDACTED : undefined,
+			...(typeof params.label === "string" && params.label.trim() ? { label: params.label.trim() } : {}),
 			cwd: runnerCwd,
 			asyncDir,
 			...(sessionRoot ? { sessionRoot } : {}),

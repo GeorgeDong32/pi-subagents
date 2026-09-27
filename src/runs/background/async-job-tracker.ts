@@ -64,6 +64,13 @@ function rememberFleetJob(state: SubagentState, job: AsyncJobState): void {
 	for (const stale of terminal.slice(MAX_RECENT_FLEET_JOBS)) state.fleetJobs.delete(stale.asyncId);
 }
 
+// Surface tuning: parent-side label stash keyed by async run id. The runner
+// event path and disk summaries redact task text (containment), so the label
+// the model wrote for the UI is remembered here instead — never persisted.
+const dispatchLabels = new Map<string, string>();
+export function rememberDispatchLabel(runId: string, label: string): void {
+	if (runId && label) dispatchLabels.set(runId, label.trim());
+}
 export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: SubagentState, asyncDirRoot: string, options: AsyncJobTrackerOptions = {}): {
 	ensurePoller: () => void;
 	refreshWidget: (ctx: ExtensionContext) => void;
@@ -139,6 +146,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}
 	};
 	const summaryToJob = (run: AsyncRunSummary): AsyncJobState => {
+		// Surface tuning: merge the parent-side dispatch label (in-memory only —
+		// disk summaries stay redacted per containment design).
+		const dispatchLabel = dispatchLabels.get(run.id);
 		const groups = normalizeParallelGroups(run.parallelGroups, run.steps.length, run.chainStepCount ?? run.steps.length);
 		const activeGroup = run.currentStep !== undefined
 			? groups.find((group) => run.currentStep! >= group.start && run.currentStep! < group.start + group.count)
@@ -162,6 +172,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			steering: run.steering,
 			mode: run.mode,
 			context: run.context,
+			...(dispatchLabel ? { label: dispatchLabel } : {}),
 			cwd: run.cwd,
 			sessionRoot: run.sessionRoot,
 			agents: visibleSteps.map((step) => step.agent),
@@ -703,6 +714,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			...(typeof info.completionOwnerId === "string" ? { completionOwnerId: info.completionOwnerId } : {}),
 			mode: info.mode ?? (info.chain ? "chain" : "single"),
 			description: info.goal ?? info.task,
+			...(typeof (info as { label?: unknown }).label === "string" && (info as { label?: string }).label!.trim() ? { label: (info as { label?: string }).label!.trim() } : {}),
 			agents,
 			chainStepCount: info.chainStepCount,
 			parallelGroups: validParallelGroups,
@@ -729,6 +741,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 
 	const handleComplete = (data: unknown) => {
+		if ((data as { id?: string } | null)?.id) dispatchLabels.delete((data as { id: string }).id);
 		const result = data as { id?: string; success?: boolean; state?: AsyncJobState["status"]; asyncDir?: string; sessionId?: string; stopped?: boolean };
 		if (typeof state.currentSessionId === "string" && result.sessionId !== state.currentSessionId) return;
 		const asyncId = result.id;

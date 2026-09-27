@@ -371,6 +371,12 @@ async function handleWatchdogCommand(
 }
 
 export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatchdogOptions = {}): MainWatchdogRuntime {
+	// Surface-tuning: the watchdog itself stays available (it is default-off);
+	// only its /subagents-watchdog command is suppressed with the rest of the family.
+	const rawRegisterCommand = pi.registerCommand.bind(pi);
+	pi = { ...pi, registerCommand: (name: string, opts: Parameters<typeof pi.registerCommand>[1]) => {
+		if (name !== "subagents-watchdog") rawRegisterCommand(name, opts);
+	} } as typeof pi;
 	let currentContext: ExtensionContext | undefined;
 	let diffBaseline: WatchdogDiffBaseline | undefined;
 	const rememberContext = (ctx: ExtensionContext) => {

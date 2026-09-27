@@ -148,14 +148,19 @@ function logSlowPhase(label: string, startedAt: number): void {
 	if (elapsed >= SLOW_RELOAD_PHASE_MS) console.error(`Subagent reload phase '${label}' took ${elapsed}ms.`);
 }
 
-function workflowLaneKeys(script: string): string[] {
-	const keys: string[] = [];
-	const seen = new Set<string>();
-	const add = (key: string): void => {
-		if (!seen.has(key)) {
-			seen.add(key);
-			keys.push(key);
-		}
+type WorkflowLane = { key?: string; agent?: string; task?: string };
+
+function workflowLaneKeys(script: string): WorkflowLane[] {
+	// Surface tuning: collect {key, agent, task} per runs.all lane object so the
+	// call row can render human task descriptions instead of internal lane keys.
+	const lanes: WorkflowLane[] = [];
+	let currentLane: WorkflowLane = {};
+	const setProp = (name: "key" | "agent" | "task", value: string): void => {
+		if (value !== undefined) currentLane[name] = value;
+	};
+	const pushLane = (): void => {
+		if (Object.keys(currentLane).length > 0) lanes.push(currentLane);
+		currentLane = {};
 	};
 	const isIdentifier = (char: string | undefined): boolean => char !== undefined && /[\w$]/.test(char);
 	const skipTrivia = (start: number): number => {
@@ -224,20 +229,26 @@ function workflowLaneKeys(script: string): string[] {
 			}
 			if (script[index] === "}") {
 				objectDepth -= 1;
-				if (objectDepth === 0) directChildObject = false;
+				if (objectDepth === 0) {
+					if (directChildObject) pushLane();
+					directChildObject = false;
+				}
 				continue;
 			}
 			if (script[index] === "," && arrayDepth === 1 && objectDepth === 0) {
 				expectingElement = true;
 				continue;
 			}
-			if (directChildObject && objectDepth === 1 && !isIdentifier(script[index - 1]) && script.startsWith("key", index) && !isIdentifier(script[index + 3])) {
-				const colon = skipTrivia(index + 3);
-				const key = script[colon] === ":" ? readLiteral(skipTrivia(colon + 1)) : undefined;
-				if (key) {
-					const next = skipTrivia(key.end);
-					if (key.key !== undefined && (script[next] === "," || script[next] === "}")) add(key.key);
-					index = key.end - 1;
+			if (directChildObject && objectDepth === 1 && !isIdentifier(script[index - 1])) {
+				const prop = (["key", "agent", "task"] as const).find((name) => script.startsWith(name, index) && !isIdentifier(script[index + name.length]));
+				if (prop) {
+					const colon = skipTrivia(index + prop.length);
+					const literal = script[colon] === ":" ? readLiteral(skipTrivia(colon + 1)) : undefined;
+					if (literal) {
+						const next = skipTrivia(literal.end);
+						if (literal.key !== undefined && (script[next] === "," || script[next] === "}")) setProp(prop, literal.key);
+						index = literal.end - 1;
+					}
 				}
 			}
 		}
@@ -256,7 +267,46 @@ function workflowLaneKeys(script: string): string[] {
 			const key = script[open] === "(" ? readLiteral(skipTrivia(open + 1)) : undefined;
 			if (key) {
 				const next = skipTrivia(key.end);
-				if (key.key !== undefined && (script[next] === "," || script[next] === ")")) add(key.key);
+				if (key.key !== undefined && (script[next] === "," || script[next] === ")")) {
+					setProp("key", key.key);
+					if (script[next] === ",") {
+						// runs.run("key", { agent, task }) — scan the second-arg
+						// object literal for top-level agent/task strings.
+						const objStart = skipTrivia(next + 1);
+						if (script[objStart] === "{") {
+							let depth = 0;
+							for (let k = objStart; k < script.length; k += 1) {
+								const lit = readLiteral(k);
+								if (lit) {
+									k = lit.end - 1;
+									continue;
+								}
+								if (script[k] === "{") {
+									depth += 1;
+									continue;
+								}
+								if (script[k] === "}") {
+									depth -= 1;
+									if (depth === 0) break;
+									continue;
+								}
+								if (depth === 1 && !isIdentifier(script[k - 1])) {
+									const prop = (["agent", "task"] as const).find((name) => script.startsWith(name, k) && !isIdentifier(script[k + name.length]));
+									if (prop) {
+										const colon = skipTrivia(k + prop.length);
+										const lit2 = script[colon] === ":" ? readLiteral(skipTrivia(colon + 1)) : undefined;
+										if (lit2 && lit2.key !== undefined) {
+											const after = skipTrivia(lit2.end);
+											if (script[after] === "," || script[after] === "}") setProp(prop, lit2.key);
+											k = lit2.end - 1;
+										}
+									}
+								}
+							}
+						}
+					}
+					pushLane();
+				}
 				index = key.end;
 				continue;
 			}
@@ -267,7 +317,7 @@ function workflowLaneKeys(script: string): string[] {
 		}
 		index += 1;
 	}
-	return keys;
+	return lanes;
 }
 
 function formatWorkflowPreflightCall(input: unknown): string {
@@ -279,16 +329,29 @@ function formatWorkflowPreflightCall(input: unknown): string {
 	}
 }
 
-function formatWorkflowManifest(script: string, async: unknown, clarify: unknown, preflightInput?: unknown): string {
-	if (clarify === true) return "workflow script · rejected: clarify UI unsupported";
-	const keys = workflowLaneKeys(script);
-	// The workflow executor starts background work unless callers pass async:false.
-	const mode = async === false ? "foreground" : "background";
+function formatWorkflowManifest(script: string, async: unknown, clarify: unknown, preflightInput?: unknown): { head: string; body: string } {
+	// Surface tuning: CC-style manifest — agent type + human task excerpt per
+	// lane; internal concepts (workflow/foreground/lanes/keys) stay in the
+	// expand layer. Returns {head, body} so the caller can color them apart.
+	if (clarify === true) return { head: "script", body: "rejected: clarify UI unsupported" };
+	const lanes = workflowLaneKeys(script);
 	const preflight = formatWorkflowPreflightCall(preflightInput);
-	if (keys.length === 0) return `workflow script · ${mode}${preflight ? ` · ${preflight}` : ""}`;
-	const visibleKeys = keys.slice(0, 4).join(", ");
-	const remainder = keys.length > 4 ? `, +${keys.length - 4}` : "";
-	return `workflow · ${mode} · ${keys.length} lane${keys.length === 1 ? "" : "s"}: ${visibleKeys}${remainder}${preflight ? ` · ${preflight}` : ""}`;
+	const preflightSuffix = preflight ? ` · ${preflight}` : "";
+	if (lanes.length === 0) return { head: "script", body: preflight };
+	const describe = (lane: WorkflowLane): string => {
+		const text = typeof lane.task === "string" && lane.task.trim() ? lane.task : lane.key ?? "";
+		const clean = text.replace(/\s+/g, " ").trim();
+		return clean.length > 28 ? `${clean.slice(0, 27)}…` : clean;
+	};
+	const agents = [...new Set(lanes.map((lane) => lane.agent).filter((agent) => typeof agent === "string" && agent))];
+	if (lanes.length === 1) {
+		const head = agents[0] ?? "agent";
+		return { head, body: `${describe(lanes[0]!)}${preflightSuffix}` };
+	}
+	const head = agents.length === 1 ? `${lanes.length}×${agents[0]}` : agents.length > 1 ? agents.join("+") : `${lanes.length} agents`;
+	const visible = lanes.slice(0, 2).map(describe).join(" · ");
+	const remainder = lanes.length > 2 ? ` · +${lanes.length - 2}` : "";
+	return { head, body: `${visible}${remainder}${preflightSuffix}` };
 }
 
 /**
@@ -825,27 +888,44 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			const gap = " ".repeat(config.mainWindowRenderer?.horizontalSpacing ?? 1);
 			const title = theme.fg("toolTitle", theme.bold("subagent"));
 			if (args.action) {
-				const target = args.agent || "";
+				// Surface tuning: show agent name, else run-id prefix, so control
+				// rows like `status` are no longer a bare keyword.
+				const target = args.agent || (typeof args.id === "string" ? args.id.slice(0, 8) : "");
 				return new Text(
-					`${title}${gap}${args.action}${target ? `${gap}${theme.fg("accent", target)}` : ""}`,
+					`${title}${gap}${args.action}${target ? `${gap}${theme.fg("dim", target)}` : ""}`,
 					0, 0,
 				);
 			}
-			if (args.workflowScript)
+			if (args.workflowScript) {
+				const manifest = formatWorkflowManifest(args.workflowScript, args.async, false, args.preflight);
 				return new Text(
-					`${title}${gap}${formatWorkflowManifest(args.workflowScript, args.async, false, args.preflight)}`,
+					`${title}${gap}${theme.fg("accent", manifest.head)}${manifest.body ? `${gap}${manifest.body}` : ""}${args.async === true ? `${gap}${theme.fg("dim", "[async]")}` : ""}`,
 					0,
 					0,
 				);
+			}
 			if (args.workflowScriptPath)
 				return new Text(
-					`${title}${gap}${theme.fg("accent", args.workflowScriptPath)}${args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : ""}${args.preflight !== undefined ? `${gap}${theme.fg("dim", formatWorkflowPreflightCall(args.preflight))}` : ""}`,
+					`${title}${gap}${theme.fg("accent", args.workflowScriptPath)}${args.async === true ? `${gap}${theme.fg("dim", "[async]")}` : ""}${args.preflight !== undefined ? `${gap}${theme.fg("dim", formatWorkflowPreflightCall(args.preflight))}` : ""}`,
 					0,
 					0,
 				);
-			const asyncLabel = args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : "";
+			// Surface tuning (CC parity, UI.tsx:411): a model-written short
+			// label is the whole headline — no agent name, no task excerpt.
+			const descText = typeof args.label === "string" ? args.label.replace(/\s+/g, " ").trim() : "";
+			if (descText)
+				return new Text(
+					`${title}${gap}${descText}${args.async === true ? `${gap}${theme.fg("dim", "[async]")}` : ""}`,
+					0,
+					0,
+				);
+			// Humanized default call row: agent + explicit model (dim) + [async] (dim) + task excerpt.
+			const asyncLabel = args.async === true ? `${gap}${theme.fg("dim", "[async]")}` : "";
+			const modelLabel = typeof args.model === "string" && args.model ? `${gap}${theme.fg("dim", args.model)}` : "";
+			const taskText = typeof args.task === "string" ? args.task.replace(/\s+/g, " ").trim() : "";
+			const taskLabel = taskText ? `${gap}${taskText.length > 60 ? `${taskText.slice(0, 57)}…` : taskText}` : "";
 			return new Text(
-				`${title}${gap}${theme.fg("accent", args.agent || "?")}${asyncLabel}`,
+				`${title}${gap}${theme.fg("accent", args.agent || "?")}${modelLabel}${asyncLabel}${taskLabel}`,
 				0,
 				0,
 			);

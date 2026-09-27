@@ -279,6 +279,11 @@ const ControlOverrides = Type.Object({
 const SubagentParamProperties = {
 	agent: Type.Optional(Type.String({ description: "One-child agent or management target." })),
 	task: Type.Optional(Type.String({ description: "One-child task; requires agent." })),
+	// Surface tuning (CC parity, AgentTool.tsx:83): a model-written short
+	// label rendered in the chat headline; the full task text stays in `task`.
+	// Named `label` (not `description`) — the schema pruner drops any key
+	// named "description" outright.
+	label: Type.Optional(Type.String({ description: "A short (3-5 word) label of what this subagent will do, shown in the chat headline." })),
 	extensionBindings: Type.Optional(Type.Unsafe({ type: "object", maxProperties: 16, additionalProperties: true, description: "Child-only plain JSON; package.name/1; depth 16, 256 props, 16 KiB." })),
 	// Management action (when present, tool operates in management mode)
 	action: Type.Optional(Type.String({ minLength: 1,

@@ -2040,6 +2040,8 @@ export type AsyncJobStep = Omit<NonNullable<AsyncStatus["steps"]>[number], "time
 };
 
 export interface AsyncJobState {
+	/** Surface tuning: parent-stashed UI label (never persisted). */
+	label?: string;
 	asyncId: string;
 	asyncDir: string;
 	/** Host tool-call id retained when it differs from the internal run id. */

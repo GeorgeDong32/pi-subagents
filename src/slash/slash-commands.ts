@@ -601,6 +601,14 @@ export function registerSlashCommands(
 	state: SubagentState,
 	options: { fleetKeybindings?: FleetKeybindingsConfig; foregroundDetachShortcut?: string } = {},
 ): { dispose: () => void } {
+	// Surface-tuning whitelist: only these commands are registered; the rest of the
+	// /subagents-* family is intentionally suppressed (status queries go through the
+	// subagent tool's action:"status").
+	const rawRegisterCommand = pi.registerCommand.bind(pi);
+	const slashCommandWhitelist = new Set(["subagents-stop", "subagents-steer", "subagents-detach"]);
+	pi = { ...pi, registerCommand: (name: string, opts: Parameters<typeof pi.registerCommand>[1]) => {
+		if (slashCommandWhitelist.has(name)) rawRegisterCommand(name, opts);
+	} } as typeof pi;
 	let fleetOpen = false;
 	let disposed = false;
 	const pendingRequests = new Set<AbortController>();

@@ -53,6 +53,7 @@ type FleetStatusTui = {
 	requestRender(): void;
 };
 type FleetStatusEntry = {
+	runLabel?: string;
 	key: string;
 	surface?: "project-pane";
 	parentKey?: string;
@@ -454,6 +455,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 				workflowWrapper: true,
 				agent: "workflow",
 				description: latestEmit !== undefined ? `latest emit: ${latestEmit}` : job.description,
+				...(job.label ? { runLabel: job.label } : {}),
 				startedAt,
 				tokens: job.totalTokens?.total ?? 0,
 				...(job.totalTokens?.window !== undefined ? { window: job.totalTokens.window } : {}),
@@ -477,6 +479,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 				...(linkedParentKey ? { parentKey: linkedParentKey } : {}),
 				agent: job.mode ?? "subagent",
 				description: job.description,
+				...(job.label ? { runLabel: job.label } : {}),
 				startedAt,
 				tokens: job.totalTokens?.total ?? 0,
 				...(job.totalTokens?.window !== undefined ? { window: job.totalTokens.window } : {}),
@@ -497,6 +500,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 				...(step.label ? { displayLabel: `${step.label} (${step.agent})` } : {}),
 				...(modelThinking ? { modelThinking } : {}),
 				description: step.description ?? job.description,
+				...(job.label && !step.label ? { runLabel: job.label } : {}),
 				startedAt: step.startedAt ?? startedAt,
 				tokens: step.tokens?.total ?? (steps.length === 1 ? job.totalTokens?.total ?? 0 : 0),
 				...((step.tokens?.window ?? (steps.length === 1 ? job.totalTokens?.window : undefined)) !== undefined
@@ -731,15 +735,10 @@ export class SubagentFleetStatus {
 			return undefined;
 		}
 
-		if (!this.active) {
-			const activates = matchesKey(data, "down") || matchesKey(data, "left");
-			if (!activates || ctx.ui.getEditorText() !== "") return undefined;
-			this.active = true;
-			this.selectedKey = "main";
-			this.refresh();
-			return { consume: true };
-		}
-
+		// Surface tuning (CC parity): the roster renders expanded by default —
+		// a flat agent list under a `● main` row. The `active` flag now only
+		// gates interactive selection (↓/← , jk, enter), so key handling is
+		// unchanged.
 		const roster = this.rosterKeys();
 		const selectedIndex = Math.max(0, roster.indexOf(this.selectedKey));
 		if (matchesKey(data, "down") || matchesKey(data, "j")) {
@@ -822,8 +821,7 @@ export class SubagentFleetStatus {
 		for (const [index, entry] of this.entries.entries()) {
 			if (!rosterIndexByKey.has(entry.key)) rosterIndexByKey.set(entry.key, index + 1);
 		}
-		const lines = [truncateToWidth(`  ${theme.fg("dim", "↑↓/jk select · enter inspect · esc back")}`, width), ""];
-		lines.push(truncateToWidth(`  ${this.bullet(0, selectedIndex, theme)} main`, width));
+		const lines = [truncateToWidth(`${this.active && selectedIndex === 0 ? theme.fg("accent", ">") : " "} ● main`, width)];
 
 		const workEntries = this.entries.filter((entry) => !entry.surface);
 		const tree = fleetTreeRows(workEntries);
@@ -882,17 +880,34 @@ export class SubagentFleetStatus {
 
 
 	private renderEntry(rosterIndex: number, selectedIndex: number, entry: FleetStatusEntry, width: number, theme: Theme, branch?: string, unclipped = false): string {
-		const label = entry.displayLabel ?? entry.agent;
-		const agent = entry.modelThinking ? `${label} (${entry.modelThinking})` : label;
-		const prefix = branch ? `    ${branch}` : " ";
-		const checklist = entry.workflowWrapper && entry.workflowChecklist
-			? ` · checklist ${formatWorkflowChecklistSummary(entry.workflowChecklist)}${entry.workflowChecklist.bottleneck ? ` · bottleneck ${formatWorkflowChecklistBottleneck(entry.workflowChecklist.bottleneck)}` : ""}`
-			: "";
-		const left = `${prefix} ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg(fleetAgentIdentityColor(entry.agent), agent)} · ${entry.state}${checklist}`;
+		// Surface tuning (CC parity, bottom agent list): `○ <type>  <label>`
+		// with elapsed right-aligned. State words, model, and token columns
+		// are dropped; the dot stays hollow (● would imply the main session).
+		// The selection marker (`>`) reappears once ↓/← enters selection mode.
+		const marker = this.active && rosterIndex === selectedIndex ? theme.fg("accent", ">") : " ";
+		const type = entry.agent ?? "subagent";
+		// Label = explicit displayLabel, else the run's task text (truncated).
+		// Redacted placeholders are skipped — containment strips task text
+		// from runner events, and "[prompt redacted]" is noise in a headline.
+		let label = String(entry.displayLabel ?? entry.runLabel ?? entry.description ?? "").replace(/\s+/g, " ").trim();
+		if (label === "[prompt redacted]") label = "";
+		if (label.length > 20) label = `${label.slice(0, 19)}…`;
+		if (!label || label === type) label = "";
 		const elapsed = Date.now() - entry.startedAt;
+		// CC-compact right column: `tokens·time` (e.g. `8.1k·16s`).
+		const compact = (value: number): string => value >= 1_000_000
+			? `${(value / 1_000_000).toFixed(1)}M`
+			: value >= 1_000
+				? `${(value / 1_000).toFixed(1)}k`
+				: `${Math.max(0, Math.round(value))}`;
 		const rightText = entry.projectPane
 			? `${entry.projectPane.summary ?? "—"} · ${formatFleetElapsed(Date.now() - entry.projectPane.refreshedAt)} ago`
-				: entry.external ? formatFleetElapsed(elapsed) : `${formatFleetElapsed(elapsed)} · ${entry.workflowWrapper ? "usage on child rows" : formatFleetTokens(entry.tokens, entry.window)}`;
+			: entry.workflowWrapper
+				? "usage on child rows"
+				: `${compact(entry.tokens)}·${formatFleetElapsed(elapsed)}`;
+		// Child rows (workflow lanes etc.) keep their branch prefix so the
+		// tree nesting stays visible in the otherwise-flat CC list.
+		const left = `${branch ? `    ${branch}` : ""}${marker} ○ ${type}${label ? `  ${label}` : ""}`;
 		const right = theme.fg("dim", rightText);
 		if (unclipped) return `${left} ${right}`;
 		return rightAlign(left, right, width);

@@ -47,6 +47,7 @@ import {
 } from "../../shared/settings.ts";
 import { normalizeSkillInput } from "../../agents/skills.ts";
 import { buildAsyncRunnerSteps, DEFAULT_ASYNC_TIMEOUT_MS, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable, workflowAwaitedAsyncResultPath } from "../background/async-execution.ts";
+import { rememberDispatchLabel } from "../background/async-job-tracker.ts";
 import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { steeringReceipt } from "../background/steering.ts";
 import { acquireActiveAsyncCapacity, ActiveAsyncCapacityError, getActiveAsyncCapacitySnapshot, resolveAbandonedSlotReleaseAfterMs, resolveMaxActiveAsyncRunsPerSession, transferActiveAsyncCapacity, type ActiveAsyncCapacityHandle } from "../background/active-async-capacity.ts";
@@ -312,6 +313,7 @@ interface TaskParam {
 }
 
 export interface SubagentParamsLike {
+	label?: string;
 	action?: string;
 	id?: string;
 	runId?: string;
@@ -3526,6 +3528,17 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		const modelOverrideFromParent = modelOrigin === "inherited";
 		const launchRuleError = applyWatchdogLaunchRules({ cwd: effectiveCwd, agent: a.name, model: modelOverride ?? (parentModel && `${parentModel.provider}/${parentModel.id}`), warn: (violation) => deps.watchdog?.displayRuleWarning(violation) });
 		if (launchRuleError) return toExecutionErrorResult(params, new Error(launchRuleError), data.contextPolicy.contextSummary);
+		// Surface tuning: stash a UI label for the fleet roster — the model's
+		// `label` when provided, else a task excerpt (the runner-side job
+		// record redacts task text, so this must be stashed parent-side).
+		const uiLabel = typeof params.label === "string" && params.label.trim()
+			? params.label.trim()
+			: typeof params.task === "string"
+				? params.task.replace(/\s+/g, " ").trim()
+					.replace(/(?:\/[\w@.-]+){3,}/g, (mm) => `…/${mm.split("/").filter(Boolean).pop()}`)
+					.slice(0, 20)
+				: "";
+		if (uiLabel) rememberDispatchLabel(id, uiLabel);
 		const asyncResult = await executeAsyncSingle(id, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
 			agent: params.agent!,
 			task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
