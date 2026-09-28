@@ -871,7 +871,6 @@ export class SubagentFleetStatus {
 		// with elapsed right-aligned. State words, model, and token columns
 		// are dropped; the dot stays hollow (● would imply the main session).
 		// The selection marker (`>`) reappears once ↓/← enters selection mode.
-		const marker = this.active && rosterIndex === selectedIndex ? theme.fg("accent", ">") : " ";
 		const type = entry.agent ?? "subagent";
 		// Label = explicit displayLabel, else the run's task text (truncated).
 		// Redacted placeholders are skipped — containment strips task text
@@ -893,10 +892,11 @@ export class SubagentFleetStatus {
 				? "usage on child rows"
 				: `${compact(entry.tokens)}·${formatFleetElapsed(elapsed)}`;
 		// Child rows (workflow lanes etc.) keep their branch prefix so the
-		// tree nesting stays visible in the otherwise-flat CC list.
-		const branchPrefix = branch ? `    ${branch} ` : "  ";
-		const selMark = this.active && rosterIndex === selectedIndex ? "> " : "  ";
-				const left = `${branchPrefix}${selMark}○ ${type}${label ? `  ${label}` : ""}`;
+		// tree nesting stays visible in the otherwise-flat CC list. Every row:
+		// marker(1) + space + tree prefix + ○/● + content — the dot column is
+		// stable across selection states (the marker never shifts content).
+		const marker = this.active && rosterIndex === selectedIndex ? theme.fg("accent", ">") : " ";
+		const left = `${marker} ${branch ? `  ${branch} ` : ""}○ ${type}${label ? `  ${label}` : ""}`;
 		const right = theme.fg("dim", rightText);
 		if (unclipped) return `${left} ${right}`;
 		return rightAlign(left, right, width);
