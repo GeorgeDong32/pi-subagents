@@ -1302,13 +1302,13 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			assert.match(lines, /Review: review \(reviewer\) \[fork\] · running · tool grep/);
 			assert.match(lines, /Verify: test \(tester\) · pending/);
 			// Row-grid pin: every same-depth row (workflow rows, checklist phase
-			// rows) shares the gutter skeleton `indent + branch + 2-char slot +
-			// glyph` — glyph columns never drift between row kinds.
+			// rows) shares the branch skeleton `indent + branch + glyph` with a
+			// single space — glyph columns never drift between row kinds.
 			const rendered = component.render(140);
-			assert.match(rendered.find((line) => line.includes("Review: review"))!, /^ {4}├─ {3}● Review: review/);
+			assert.match(rendered.find((line) => line.includes("Review: review"))!, /^ {4}├─ ● Review: review/);
 			const phaseLine = rendered.find((line) => /^\s{4}[├└]─/.test(line) && /· (\d )?running/.test(line));
 			assert.ok(phaseLine, "checklist phase row renders");
-			assert.match(phaseLine!, /^ {4}[├└]─ {3}/);
+			assert.match(phaseLine!, /^ {4}[├└]─ /);
 		} finally {
 			fleet.dispose();
 		}
@@ -1588,17 +1588,18 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			const component = widgetFactory!(tui, theme);
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			let lines = component.render(180);
-			// Unselected child rows keep a 2-char slot after the branch connector.
-			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /^ {4}├─ {3}○ reviewer/);
+			// Unselected child rows are tight: branch + single space + glyph.
+			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /^ {4}├─ ○ reviewer/);
 			assert.ok(lines.some((line) => line.includes("· 4.2k tok")), "nested child row shows token spend");
-			// Selecting the first child moves the arrow into the tree, at the
-			// row's own depth — main loses the arrow, columns never shift.
+			// Selecting the first child moves the arrow into the tree, taking
+			// over the dot's cell in place — main loses the arrow, the dot
+			// column (and every sibling row) never moves.
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			lines = component.render(180);
 			assert.match(lines.find((line) => line.includes("● main"))!, /^ {2}● main/);
-			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /^ {4}├─ > ○ reviewer/);
-			assert.match(lines.find((line) => line.includes("○ tester"))!, /^ {4}└─ {3}○ tester/);
+			assert.match(lines.find((line) => line.includes("reviewer"))!, /^ {4}├─ > reviewer/);
+			assert.match(lines.find((line) => line.includes("○ tester"))!, /^ {4}└─ ○ tester/);
 		} finally {
 			fleet.dispose();
 		}
