@@ -1521,6 +1521,81 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 		}
 	});
 
+	it("puts the selection arrow inside the tree and shows nested child token spend", () => {
+		const state = stateForTest();
+		state.asyncJobs.set("workflow-1", {
+			asyncId: "workflow-1",
+			asyncDir: "/tmp/workflow-1",
+			status: "running",
+			mode: "workflow",
+			startedAt: 10,
+			updatedAt: 20,
+		});
+		state.foregroundControls.set("child-1", {
+			runId: "child-1",
+			parentWorkflowRunId: "workflow-1",
+			workflowKey: "review",
+			mode: "single",
+			startedAt: 11,
+			updatedAt: 20,
+			activeChildren: new Map([[0, { index: 0, agent: "reviewer", startedAt: 11, updatedAt: 20 }]]),
+			nestedChildren: [{
+				id: "nested-review",
+				parentRunId: "child-1",
+				parentStepIndex: 0,
+				depth: 1,
+				path: [{ runId: "child-1", stepIndex: 0 }],
+				state: "complete",
+				agent: "nested-reviewer",
+				startedAt: 1_000,
+				endedAt: 4_000,
+				totalTokens: { input: 4_000, output: 200, total: 4_200 },
+			}],
+		});
+		state.foregroundControls.set("child-2", {
+			runId: "child-2",
+			parentWorkflowRunId: "workflow-1",
+			workflowKey: "test",
+			mode: "single",
+			startedAt: 12,
+			updatedAt: 20,
+			activeChildren: new Map([[0, { index: 0, agent: "tester", startedAt: 12, updatedAt: 20 }]]),
+		});
+		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
+		let widgetFactory: ((tui: unknown, theme: typeof theme) => { render(width: number): string[] }) | undefined;
+		const ctx = {
+			hasUI: true,
+			ui: {
+				setWidget(_key: string, content: typeof widgetFactory | undefined) { if (content) widgetFactory = content; },
+				onTerminalInput() { return () => {}; },
+				getEditorText() { return ""; },
+				requestRender() {},
+				notify() {},
+				theme,
+			},
+		} as unknown as ExtensionContext;
+		try {
+			fleet.setContext(ctx);
+			const tui = { requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor };
+			const component = widgetFactory!(tui, theme);
+			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
+			let lines = component.render(180);
+			// Unselected child rows keep a 2-char slot after the branch connector.
+			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /├─ {3}○ reviewer/);
+			assert.ok(lines.some((line) => line.includes("· 4.2k tok")), "nested child row shows token spend");
+			// Selecting the first child moves the arrow into the tree, at the
+			// row's own depth — main loses the arrow, columns never shift.
+			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
+			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
+			lines = component.render(180);
+			assert.match(lines.find((line) => line.includes("● main"))!, /^ {2}● main/);
+			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /├─ > ○ reviewer/);
+			assert.match(lines.find((line) => line.includes("○ tester"))!, /└─ {3}○ tester/);
+		} finally {
+			fleet.dispose();
+		}
+	});
+
 	it("only captures navigation at an empty editor and opens the selected child", async () => {
 		const state = stateForTest();
 		state.foregroundControls.set("run-worker", {

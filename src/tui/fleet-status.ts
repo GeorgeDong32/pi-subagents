@@ -84,6 +84,8 @@ type FleetNestedRow = {
 	activity?: string;
 	startedAt?: number;
 	endedAt?: number;
+	/** Total tokens reported by the child run; shown once the run reports usage. */
+	tokens?: number;
 	depth: number;
 	overflow?: number;
 };
@@ -126,6 +128,15 @@ export function formatFleetTokens(count: number, window?: number, windowCount = 
 	return window !== undefined
 		? `↓ ${compact(window)} ${windowCount > 1 ? "Σ windows" : "window"} · ${compact(count)} spent`
 		: `↓ ${compact(count)} tokens`;
+}
+
+/** CC-compact token count for tight row columns (e.g. `8.1k`). */
+function compactTokenCount(value: number): string {
+	return value >= 1_000_000
+		? `${(value / 1_000_000).toFixed(1)}M`
+		: value >= 1_000
+			? `${(value / 1_000).toFixed(1)}k`
+			: `${Math.max(0, Math.round(value))}`;
 }
 
 function rightAlign(left: string, right: string, width: number): string {
@@ -266,6 +277,7 @@ function nestedFleetRows(children: NestedRunSummary[] | undefined, visibleLimit:
 					...(activity ? { activity } : {}),
 					...(child.startedAt !== undefined ? { startedAt: child.startedAt } : {}),
 					...(child.endedAt !== undefined ? { endedAt: child.endedAt } : {}),
+					...(child.totalTokens?.total !== undefined ? { tokens: child.totalTokens.total } : {}),
 				});
 			}
 			if (!appendRuns(child.children, depth + 1)) {
@@ -808,7 +820,7 @@ export class SubagentFleetStatus {
 		}
 				// Surface tuning: fixed 2-char selection slot per row — the ●/○ column
 		// never shifts when the selection moves.
-		const lines = [truncateToWidth(`${this.active && selectedIndex === 0 ? "> " : "  "}● main`, width)];
+		const lines = [truncateToWidth(`${this.active && selectedIndex === 0 ? theme.fg("accent", "> ") : "  "}● main`, width)];
 
 		const workEntries = this.entries.filter((entry) => !entry.surface);
 		const tree = fleetTreeRows(workEntries);
@@ -881,22 +893,18 @@ export class SubagentFleetStatus {
 		if (!label || label === type) label = "";
 		const elapsed = Date.now() - entry.startedAt;
 		// CC-compact right column: `tokens·time` (e.g. `8.1k·16s`).
-		const compact = (value: number): string => value >= 1_000_000
-			? `${(value / 1_000_000).toFixed(1)}M`
-			: value >= 1_000
-				? `${(value / 1_000).toFixed(1)}k`
-				: `${Math.max(0, Math.round(value))}`;
 		const rightText = entry.projectPane
 			? `${entry.projectPane.summary ?? "—"} · ${formatFleetElapsed(Date.now() - entry.projectPane.refreshedAt)} ago`
 			: entry.workflowWrapper
 				? "usage on child rows"
-				: `${compact(entry.tokens)}·${formatFleetElapsed(elapsed)}`;
+				: `${compactTokenCount(entry.tokens)}·${formatFleetElapsed(elapsed)}`;
 		// Child rows (workflow lanes etc.) keep their branch prefix so the
-		// tree nesting stays visible in the otherwise-flat CC list. Every row:
-		// marker(1) + space + tree prefix + ○/● + content — the dot column is
-		// stable across selection states (the marker never shifts content).
-		const marker = this.active && rosterIndex === selectedIndex ? theme.fg("accent", ">") : " ";
-		const left = `${marker} ${branch ? `  ${branch} ` : ""}○ ${type}${label ? `  ${label}` : ""}`;
+		// tree nesting stays visible in the otherwise-flat CC list. The fixed
+		// 2-char selection slot sits INSIDE the tree — right after the branch
+		// connector (upstream `bullet()` position) — so `>` appears at the
+		// row's own depth and content columns never shift on selection.
+		const slot = this.active && rosterIndex === selectedIndex ? theme.fg("accent", "> ") : "  ";
+		const left = `${branch ? `    ${branch} ` : ""}${slot}○ ${type}${label ? `  ${label}` : ""}`;
 		const right = theme.fg("dim", rightText);
 		if (unclipped) return `${left} ${right}`;
 		return rightAlign(left, right, width);
@@ -910,7 +918,9 @@ export class SubagentFleetStatus {
 		const activity = row.activity ? ` · ${row.activity}` : "";
 		const left = `${indent}${marker} ${nestedStatusGlyph(row.state, theme, row.thinking)} ${theme.fg(fleetAgentIdentityColor(row.agentIdentity ?? row.name), `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
 		const elapsed = detailElapsed(row);
-		return truncateToWidth(`${left}${elapsed !== undefined ? theme.fg("dim", ` · ${elapsed}`) : ""}`, width);
+		// Surface tuning: show the child run's token spend once usage is reported.
+		const tokens = row.tokens !== undefined ? ` · ${compactTokenCount(row.tokens)} tok` : "";
+		return truncateToWidth(`${left}${elapsed !== undefined ? theme.fg("dim", ` · ${elapsed}`) : ""}${theme.fg("dim", tokens)}`, width);
 	}
 
 	private workflowRowGlyph(row: AsyncStatusWorkflowRow, theme: Theme): string {
