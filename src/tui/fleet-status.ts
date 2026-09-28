@@ -814,7 +814,7 @@ export class SubagentFleetStatus {
 		const visibleCount = Math.min(this.maxAgentRows, tree.length);
 		const start = selectedTreeIndex < visibleCount ? 0 : selectedTreeIndex - visibleCount + 1;
 		const hiddenBelow = tree.length - (start + visibleCount);
-		if (start > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), width));
+		if (start > 0 && tree.length > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), width));
 		for (let index = start; index < start + visibleCount; index++) {
 			const row = tree[index]!;
 			if (row.kind === "owner" || row.kind === "child") {

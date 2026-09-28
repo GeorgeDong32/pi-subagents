@@ -606,9 +606,18 @@ export function registerSlashCommands(
 	// subagent tool's action:"status").
 	const rawRegisterCommand = pi.registerCommand.bind(pi);
 	const slashCommandWhitelist = new Set(["subagents-stop", "subagents-steer", "subagents-detach"]);
-	pi = { ...pi, registerCommand: (name: string, opts: Parameters<typeof pi.registerCommand>[1]) => {
-		if (slashCommandWhitelist.has(name)) rawRegisterCommand(name, opts);
-	} } as typeof pi;
+	// Proxy (not spread): the ExtensionAPI carries prototype methods that a
+	// spread copy would drop.
+	pi = new Proxy(pi, {
+		get(target, prop, receiver) {
+			if (prop === "registerCommand") {
+				return (name: string, opts: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
+					if (slashCommandWhitelist.has(name)) rawRegisterCommand(name, opts);
+				};
+			}
+			return Reflect.get(target, prop, receiver);
+		},
+	}) as typeof pi;
 	let fleetOpen = false;
 	let disposed = false;
 	const pendingRequests = new Set<AbortController>();

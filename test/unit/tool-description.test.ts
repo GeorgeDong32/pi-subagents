@@ -10,6 +10,8 @@ import {
 	buildSubagentToolPromptMetadata,
 	COMPACT_SUBAGENT_TOOL_DESCRIPTION,
 	DEFAULT_SUBAGENT_TOOL_DESCRIPTION,
+	withLabelGuidance,
+	SUBAGENT_LABEL_GUIDANCE,
 	FULL_SUBAGENT_TOOL_DESCRIPTION,
 	SUBAGENT_SAFETY_GUIDANCE,
 	SUBAGENT_TOOL_PROMPT_GUIDELINES,
@@ -53,7 +55,7 @@ describe("registered subagent tool description", () => {
 	});
 
 	it("uses concise split metadata only by default", () => {
-		assert.equal(buildSubagentToolDescription(), DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(buildSubagentToolDescription(), withLabelGuidance(DEFAULT_SUBAGENT_TOOL_DESCRIPTION));
 		const metadata = buildSubagentToolPromptMetadata();
 		assert.equal(SUBAGENT_TOOL_PROMPT_SNIPPET, "For operator-requested delegation, use subagents; compose multi-child work in one workflow call.");
 		assert.deepEqual(SUBAGENT_TOOL_PROMPT_GUIDELINES, [
@@ -109,8 +111,8 @@ describe("registered subagent tool description", () => {
 	});
 
 	it("keeps full mode supplemental details and moves recipes to shipped guides", () => {
-		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "full" }), FULL_SUBAGENT_TOOL_DESCRIPTION);
-		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "compact" }), COMPACT_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "full" }), withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
+		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "compact" }), withLabelGuidance(COMPACT_SUBAGENT_TOOL_DESCRIPTION));
 		assert.ok(COMPACT_SUBAGENT_TOOL_DESCRIPTION.length < FULL_SUBAGENT_TOOL_DESCRIPTION.length);
 		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /runs.lanes.*structuredOutput.verdict === 'blocked'.*never reviewer prose/);
 		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /mission:false.*state.get.*state.set/);
@@ -223,7 +225,7 @@ describe("registered subagent tool description", () => {
 			{ cwd, agentDir, warn: (message) => warnings.push(message) },
 		);
 
-		assert.equal(description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
 		assert.ok(warnings.some((message) => message.includes("using full description")));
 	});
 
@@ -235,7 +237,7 @@ describe("registered subagent tool description", () => {
 			{ warn: (message) => warnings.push(message) },
 		);
 
-		assert.equal(description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
 		assert.ok(warnings.some((message) => message.includes("Ignoring invalid toolDescriptionMode")));
 	});
 
@@ -287,7 +289,7 @@ describe("registered subagent tool description", () => {
 		const defaultAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-default-"));
 		writeExtensionConfig(defaultAgentDir, {});
 		const defaultTool = readRegisteredTool(defaultAgentDir);
-		assert.equal(defaultTool.description, DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(defaultTool.description, withLabelGuidance(DEFAULT_SUBAGENT_TOOL_DESCRIPTION));
 		assert.equal(defaultTool.properties.includes("step"), false);
 		assert.doesNotMatch(defaultTool.description, /append-step|approve-checkpoint|reject-checkpoint/);
 		assert.equal(defaultTool.promptSnippet, SUBAGENT_TOOL_PROMPT_SNIPPET);
@@ -296,14 +298,14 @@ describe("registered subagent tool description", () => {
 		const fullAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-full-"));
 		writeExtensionConfig(fullAgentDir, { toolDescriptionMode: "full" });
 		const fullTool = readRegisteredTool(fullAgentDir);
-		assert.equal(fullTool.description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(fullTool.description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
 		assert.equal(fullTool.promptSnippet, undefined);
 		assert.equal(fullTool.promptGuidelines, undefined);
 
 		const compactAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-compact-"));
 		writeExtensionConfig(compactAgentDir, { toolDescriptionMode: "compact" });
 		const compactTool = readRegisteredTool(compactAgentDir);
-		assert.equal(compactTool.description, COMPACT_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(compactTool.description, withLabelGuidance(COMPACT_SUBAGENT_TOOL_DESCRIPTION));
 		assert.equal(compactTool.promptSnippet, undefined);
 		assert.equal(compactTool.promptGuidelines, undefined);
 
@@ -316,10 +318,10 @@ describe("registered subagent tool description", () => {
 
 		const missingCustomAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-missing-"));
 		writeExtensionConfig(missingCustomAgentDir, { toolDescriptionMode: "custom" });
-		assert.equal(readRegisteredTool(missingCustomAgentDir).description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(readRegisteredTool(missingCustomAgentDir).description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
 
 		const invalidAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-invalid-"));
 		writeExtensionConfig(invalidAgentDir, { toolDescriptionMode: "tiny" });
-		assert.equal(readRegisteredTool(invalidAgentDir).description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(readRegisteredTool(invalidAgentDir).description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
 	});
 });

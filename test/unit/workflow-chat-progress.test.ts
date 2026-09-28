@@ -544,7 +544,7 @@ describe("workflow chat progress rendering", () => {
 		const expanded = renderSubagentResult(result, { expanded: true }, theme as any, undefined, { horizontalSpacing: 0, compactResultMaxLines: 3 }).render(120);
 		assert.ok(expanded.length > 3);
 		assert.match(expanded[1]!, /^  Repo   pi-subagents\s*$/);
-		assert.match(expanded.join("\n"), /phase-9 1 active/);
+		assert.match(expanded.join("\n"), /phase-9 · running/);
 		assert.doesNotMatch(expanded.join("\n"), /rows hidden · .* expands/);
 	});
 

@@ -647,7 +647,7 @@ describe("async run status inspection", () => {
 			const text = textContent(result);
 			assert.equal(result.isError, undefined);
 			assert.match(text, /Workflow checklist: 0\/1 done · 1 active/);
-			assert.match(text, /CI 1 active/);
+			assert.match(text, /CI · running/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

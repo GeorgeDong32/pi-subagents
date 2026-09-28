@@ -232,6 +232,6 @@ test("workflow checklist text can suppress item rows for status surfaces", () =>
 	const text = formatWorkflowChecklistText(projection, "", { includeItems: false }).join("\n");
 
 	assert.match(text, /Workflow checklist:/);
-	assert.match(text, /writers 1 done · 1 active/);
+	assert.match(text, /writers · 1 done · running/);
 	assert.doesNotMatch(text, /writer-b · writer · active/);
 });

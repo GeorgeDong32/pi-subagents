@@ -158,12 +158,20 @@ function withMandatorySafetyGuidance(description: string): string {
 		: SUBAGENT_SAFETY_GUIDANCE;
 }
 
-// Surface tuning (CC parity, AgentTool/prompt.ts:256): appended to every
-// tool-description mode so the model fills `label` for the call-row headline.
-const SUBAGENT_LABEL_GUIDANCE = "\n\nAlways include a short `label` (3-5 words) summarizing what the subagent will do; it is shown as the call headline.";
+// Surface tuning (CC parity, AgentTool/prompt.ts:256): instructs the model to
+// fill `label` for the call-row headline. Inserted BEFORE the trailing safety
+// guidance so the safety posture stays the final word of the description.
+export const SUBAGENT_LABEL_GUIDANCE = "\n\nAlways include a short `label` (3-5 words) summarizing what the subagent will do; it is shown as the call headline.";
+
+export function withLabelGuidance(description: string): string {
+	if (description.endsWith(SUBAGENT_SAFETY_GUIDANCE)) {
+		return description.slice(0, -SUBAGENT_SAFETY_GUIDANCE.length) + SUBAGENT_LABEL_GUIDANCE + SUBAGENT_SAFETY_GUIDANCE;
+	}
+	return description + SUBAGENT_LABEL_GUIDANCE;
+}
 
 export function buildSubagentToolDescription(config: Pick<ExtensionConfig, "toolDescriptionMode"> = {}, options?: ToolDescriptionOptions): string {
-	if (config.toolDescriptionMode === undefined) return DEFAULT_SUBAGENT_TOOL_DESCRIPTION + SUBAGENT_LABEL_GUIDANCE;
+	if (config.toolDescriptionMode === undefined) return withLabelGuidance(DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
 	const mode = resolveToolDescriptionMode(config, options);
 	let description: string;
 	if (mode === "compact") description = COMPACT_SUBAGENT_TOOL_DESCRIPTION;
@@ -175,5 +183,5 @@ export function buildSubagentToolDescription(config: Pick<ExtensionConfig, "tool
 			description = FULL_SUBAGENT_TOOL_DESCRIPTION;
 		}
 	} else description = FULL_SUBAGENT_TOOL_DESCRIPTION;
-	return description + SUBAGENT_LABEL_GUIDANCE;
+	return withLabelGuidance(description);
 }
