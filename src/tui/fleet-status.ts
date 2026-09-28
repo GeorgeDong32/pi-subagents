@@ -139,6 +139,17 @@ function compactTokenCount(value: number): string {
 			: `${Math.max(0, Math.round(value))}`;
 }
 
+/**
+ * Fixed row skeleton shared by EVERY roster/tree row (entries, workflow
+ * rows, phase rows, nested rows, main): [indent][branch ][slot][glyph].
+ * The 2-char selection slot sits inside the tree right before the glyph,
+ * so `>` appears at the row's own depth and same-depth glyphs always
+ * share one column — no row kind has its own prefix geometry to drift.
+ */
+function treeGutter(depth: number, branch: string | undefined, selected: boolean, theme: Theme): string {
+	return `${"    ".repeat(depth)}${branch ? `${branch} ` : ""}${selected ? theme.fg("accent", "> ") : "  "}`;
+}
+
 function rightAlign(left: string, right: string, width: number): string {
 	const rightWidth = visibleWidth(right);
 	const maxLeftWidth = Math.max(0, width - rightWidth - 1);
@@ -820,7 +831,7 @@ export class SubagentFleetStatus {
 		}
 				// Surface tuning: fixed 2-char selection slot per row — the ●/○ column
 		// never shifts when the selection moves.
-		const lines = [truncateToWidth(`${this.active && selectedIndex === 0 ? theme.fg("accent", "> ") : "  "}● main`, width)];
+		const lines = [truncateToWidth(`${treeGutter(0, undefined, this.active && selectedIndex === 0, theme)}● main`, width)];
 
 		const workEntries = this.entries.filter((entry) => !entry.surface);
 		const tree = fleetTreeRows(workEntries);
@@ -899,24 +910,20 @@ export class SubagentFleetStatus {
 				? "usage on child rows"
 				: `${compactTokenCount(entry.tokens)}·${formatFleetElapsed(elapsed)}`;
 		// Child rows (workflow lanes etc.) keep their branch prefix so the
-		// tree nesting stays visible in the otherwise-flat CC list. The fixed
-		// 2-char selection slot sits INSIDE the tree — right after the branch
-		// connector (upstream `bullet()` position) — so `>` appears at the
-		// row's own depth and content columns never shift on selection.
-		const slot = this.active && rosterIndex === selectedIndex ? theme.fg("accent", "> ") : "  ";
-		const left = `${branch ? `    ${branch} ` : ""}${slot}○ ${type}${label ? `  ${label}` : ""}`;
+		// tree nesting stays visible in the otherwise-flat CC list; the row
+		// skeleton (gutter + slot + glyph) is shared with every other row.
+		const left = `${treeGutter(branch ? 1 : 0, branch, this.active && rosterIndex === selectedIndex, theme)}○ ${type}${label ? `  ${label}` : ""}`;
 		const right = theme.fg("dim", rightText);
 		if (unclipped) return `${left} ${right}`;
 		return rightAlign(left, right, width);
 	}
 
 	private renderNestedRow(row: FleetNestedRow, last: boolean, width: number, theme: Theme): string {
-		const marker = last ? "└─" : "├─";
-		const indent = "    ".repeat(row.depth + 1);
-		if (row.overflow !== undefined) return truncateToWidth(`${indent}${marker} ${theme.fg("dim", `+${row.overflow} nested leaves`)}`, width);
+		// Nested rows live one level under their owner child entry (+1 depth).
+		if (row.overflow !== undefined) return truncateToWidth(`${treeGutter(row.depth + 1, last ? "└─" : "├─", false, theme)}${theme.fg("dim", `+${row.overflow} nested leaves`)}`, width);
 		const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
 		const activity = row.activity ? ` · ${row.activity}` : "";
-		const left = `${indent}${marker} ${nestedStatusGlyph(row.state, theme, row.thinking)} ${theme.fg(fleetAgentIdentityColor(row.agentIdentity ?? row.name), `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
+		const left = `${treeGutter(row.depth + 1, last ? "└─" : "├─", false, theme)}${nestedStatusGlyph(row.state, theme, row.thinking)} ${theme.fg(fleetAgentIdentityColor(row.agentIdentity ?? row.name), `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
 		const elapsed = detailElapsed(row);
 		// Surface tuning: show the child run's token spend once usage is reported.
 		const tokens = row.tokens !== undefined ? ` · ${compactTokenCount(row.tokens)} tok` : "";
@@ -943,7 +950,6 @@ export class SubagentFleetStatus {
 	}
 
 	private renderWorkflowPhaseRow(phase: WorkflowChecklistPhase, last: boolean, width: number, theme: Theme): string {
-		const marker = last ? "└─" : "├─";
 		const glyph = phase.state === "complete"
 			? theme.fg("success", "✓")
 			: phase.state === "running"
@@ -953,13 +959,11 @@ export class SubagentFleetStatus {
 					: phase.state === "queued"
 						? theme.fg("muted", "◦")
 						: theme.fg("warning", "■");
-		return truncateToWidth(`    ${marker} ${glyph} ${theme.fg("muted", formatWorkflowChecklistPhase(phase))}`, width);
+		return truncateToWidth(`${treeGutter(1, last ? "└─" : "├─", false, theme)}${glyph} ${theme.fg("muted", formatWorkflowChecklistPhase(phase))}`, width);
 	}
 
 	private renderWorkflowRow(row: AsyncStatusWorkflowRow, last: boolean, width: number, theme: Theme): string {
-		const marker = last ? "└─" : "├─";
-		const indent = "    ";
-		if (row.overflow !== undefined) return truncateToWidth(`${indent}${marker} ${theme.fg("dim", `+${row.overflow} hidden workflow steps`)}`, width);
+		if (row.overflow !== undefined) return truncateToWidth(`${treeGutter(1, last ? "└─" : "├─", false, theme)}${theme.fg("dim", `+${row.overflow} hidden workflow steps`)}`, width);
 		const context = contextModeLabel(row.context);
 		const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
 		const activity = row.activity ? ` · ${row.activity}` : "";
@@ -971,7 +975,7 @@ export class SubagentFleetStatus {
 			row.preflight.expectedOutput ? `expected:${row.preflight.expectedOutput}` : undefined,
 			row.preflight.independence ? `independence:${row.preflight.independence}` : undefined,
 		].filter((value): value is string => Boolean(value)).join(" · ") : "";
-		const left = `${indent}${marker} ${this.workflowRowGlyph(row, theme)} ${theme.fg("muted", `${kind}${row.name}${context ? ` ${context}` : ""}${modelThinking}`)} · ${this.workflowRowStateLabel(row, theme)}${activity}${hints ? ` · ${hints}` : ""}`;
+		const left = `${treeGutter(1, last ? "└─" : "├─", false, theme)}${this.workflowRowGlyph(row, theme)} ${theme.fg("muted", `${kind}${row.name}${context ? ` ${context}` : ""}${modelThinking}`)} · ${this.workflowRowStateLabel(row, theme)}${activity}${hints ? ` · ${hints}` : ""}`;
 		const details = [
 			detailElapsed(row),
 			row.tokens !== undefined ? formatFleetTokens(row.tokens, row.window) : undefined,

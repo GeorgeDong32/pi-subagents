@@ -1301,6 +1301,14 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			assert.match(lines, /Plan: scan · Find seams \(scout\) \[fresh\] \(gpt-5\.6-luna · thinking max\) · complete/);
 			assert.match(lines, /Review: review \(reviewer\) \[fork\] · running · tool grep/);
 			assert.match(lines, /Verify: test \(tester\) · pending/);
+			// Row-grid pin: every same-depth row (workflow rows, checklist phase
+			// rows) shares the gutter skeleton `indent + branch + 2-char slot +
+			// glyph` — glyph columns never drift between row kinds.
+			const rendered = component.render(140);
+			assert.match(rendered.find((line) => line.includes("Review: review"))!, /^ {4}├─ {3}● Review: review/);
+			const phaseLine = rendered.find((line) => /^\s{4}[├└]─/.test(line) && /· (\d )?running/.test(line));
+			assert.ok(phaseLine, "checklist phase row renders");
+			assert.match(phaseLine!, /^ {4}[├└]─ {3}/);
 		} finally {
 			fleet.dispose();
 		}
@@ -1581,7 +1589,7 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			let lines = component.render(180);
 			// Unselected child rows keep a 2-char slot after the branch connector.
-			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /├─ {3}○ reviewer/);
+			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /^ {4}├─ {3}○ reviewer/);
 			assert.ok(lines.some((line) => line.includes("· 4.2k tok")), "nested child row shows token spend");
 			// Selecting the first child moves the arrow into the tree, at the
 			// row's own depth — main loses the arrow, columns never shift.
@@ -1589,8 +1597,8 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			lines = component.render(180);
 			assert.match(lines.find((line) => line.includes("● main"))!, /^ {2}● main/);
-			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /├─ > ○ reviewer/);
-			assert.match(lines.find((line) => line.includes("○ tester"))!, /└─ {3}○ tester/);
+			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /^ {4}├─ > ○ reviewer/);
+			assert.match(lines.find((line) => line.includes("○ tester"))!, /^ {4}└─ {3}○ tester/);
 		} finally {
 			fleet.dispose();
 		}
