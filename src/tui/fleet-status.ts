@@ -892,7 +892,9 @@ export class SubagentFleetStatus {
 				: `${compact(entry.tokens)}·${formatFleetElapsed(elapsed)}`;
 		// Child rows (workflow lanes etc.) keep their branch prefix so the
 		// tree nesting stays visible in the otherwise-flat CC list.
-		const left = `${branch ? `    ${branch} ` : ""}${this.active && rosterIndex === selectedIndex ? "> " : ""}○ ${type}${label ? `  ${label}` : ""}`;
+		const branchPrefix = branch ? `    ${branch} ` : "  ";
+		const selMark = this.active && rosterIndex === selectedIndex ? "> " : "";
+		const left = `${branchPrefix}${selMark}○ ${type}${label ? `  ${label}` : ""}`;
 		const right = theme.fg("dim", rightText);
 		if (unclipped) return `${left} ${right}`;
 		return rightAlign(left, right, width);
