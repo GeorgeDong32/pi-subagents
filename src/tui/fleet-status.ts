@@ -806,7 +806,9 @@ export class SubagentFleetStatus {
 		for (const [index, entry] of this.entries.entries()) {
 			if (!rosterIndexByKey.has(entry.key)) rosterIndexByKey.set(entry.key, index + 1);
 		}
-		const lines = [truncateToWidth(`${this.active && selectedIndex === 0 ? theme.fg("accent", ">") : " "} ● main`, width)];
+				// Surface tuning: fixed 2-char selection slot per row — the ●/○ column
+		// never shifts when the selection moves.
+		const lines = [truncateToWidth(`${this.active && selectedIndex === 0 ? "> " : "  "}● main`, width)];
 
 		const workEntries = this.entries.filter((entry) => !entry.surface);
 		const tree = fleetTreeRows(workEntries);
@@ -893,8 +895,8 @@ export class SubagentFleetStatus {
 		// Child rows (workflow lanes etc.) keep their branch prefix so the
 		// tree nesting stays visible in the otherwise-flat CC list.
 		const branchPrefix = branch ? `    ${branch} ` : "  ";
-		const selMark = this.active && rosterIndex === selectedIndex ? "> " : "";
-		const left = `${branchPrefix}${selMark}○ ${type}${label ? `  ${label}` : ""}`;
+		const selMark = this.active && rosterIndex === selectedIndex ? "> " : "  ";
+				const left = `${branchPrefix}${selMark}○ ${type}${label ? `  ${label}` : ""}`;
 		const right = theme.fg("dim", rightText);
 		if (unclipped) return `${left} ${right}`;
 		return rightAlign(left, right, width);
