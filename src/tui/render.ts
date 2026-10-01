@@ -3404,6 +3404,10 @@ export function renderSubagentSummary(
 	// lives in the fleet roster. The summary row appears on completion
 	// (CC's "Done (…)" line), rendering zero lines while running.
 	if (state === "running") return new Text("", 0, 0);
+	// CC result-slot gutter: nest the completion line under the call row's
+	// ⎿ slot (same visual language as cctui's cc-rows and the notify renderer)
+	// instead of a bare parallel line.
+	const gutter = theme.fg("dim", "  ⎿  ");
 	const glyph = state === "completed"
 		? theme.fg("success", "✓")
 		: state === "failed"
@@ -3414,7 +3418,7 @@ export function renderSubagentSummary(
 		// Surface tuning: "workflow" is an internal concept — plural agents reads better.
 		: details?.mode === "workflow" ? "subagents" : details?.mode || "subagent";
 	return new Text(
-		truncLine(`${glyph} ${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", "·")} ${theme.fg(state === "failed" ? "error" : state === "completed" ? "success" : "warning", state)}`, getTermWidth() - 4),
+		truncLine(`${gutter}${glyph} ${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", "·")} ${theme.fg(state === "failed" ? "error" : state === "completed" ? "success" : "warning", state)}`, getTermWidth() - 4),
 		0,
 		0,
 	);
