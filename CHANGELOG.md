@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Background subagents failed to start on Pi 1.0.0 with "does not provide @earendil-works/pi-agent-core/node", because that Pi release no longer ships the module. Background launches now skip it when the installed Pi does not offer it, and still fail when Pi offers it but the file is missing. Thanks to [@albertgwo](https://github.com/albertgwo) for [#2634](https://github.com/nicobailon/pi-subagents/pull/2634).
 - Turning on `subagent` no longer throws away the prompt cache. The catalog of advertised agents is now sent as its own `advertised_subagents` prompt section, which Pi adds at the end of the conversation. Before, pi-subagents rewrote the whole system prompt, so the first message after `subagents_enable` resent the entire conversation to the cache. Fixes [#2518](https://github.com/nicobailon/pi-subagents/issues/2518). Thanks to [@javapacr](https://github.com/javapacr) for [#2519](https://github.com/nicobailon/pi-subagents/pull/2519).
 
 ## [0.73.0] - 2026-09-27
