@@ -608,9 +608,10 @@ export function registerSlashCommands(
 ): { dispose: () => void } {
 	// Surface-tuning whitelist: only these commands are registered; the rest of the
 	// /subagents-* family is intentionally suppressed (status queries go through the
-	// subagent tool's action:"status").
+	// subagent tool's action:"status"). "run" stays registered: with workflow-scripts
+	// disabled it is the only slash entry that launches a child directly (upstream #2596).
 	const rawRegisterCommand = pi.registerCommand.bind(pi);
-	const slashCommandWhitelist = new Set(["subagents-stop", "subagents-steer", "subagents-detach"]);
+	const slashCommandWhitelist = new Set(["run", "subagents-stop", "subagents-steer", "subagents-detach"]);
 	// Proxy (not spread): the ExtensionAPI carries prototype methods that a
 	// spread copy would drop.
 	pi = new Proxy(pi, {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Synced (fork)
+
+- Merged upstream `nicobailon/pi-subagents` main through 2026-10-04 (88 commits, v0.74.0 + v0.75.0: fenced-block workflows, disabledFeatures, per-model tool activation, mission/cost/MCP/watchdog fixes, undici security bump). Fork-side adaptation on top: `label` guidance moved into the feature-aware description assemblers (safety guidance stays last); path-form `workflow: "./path.js"` calls render a CC-style manifest (agent + task excerpt per lane) with a bounded mtime cache; reply-block and named-resource calls keep the upstream row; the slash whitelist now keeps `/run`, which is the only direct-launch slash entry when workflow scripts are disabled (upstream #2596 contract).
+
 ### Added
 
 - Schedules accept `every: "day"` or `"week"` with a local `HH:mm`, an explicit IANA timezone, and weekly weekday selections. Missing local times are skipped and repeated times fire once. Restoration re-resolves the pending local date; existing overlap, catch-up, quiet and mission controls apply. Thanks to [@quifox](https://github.com/quifox) for [#815](https://github.com/nicobailon/pi-subagents/issues/815).
