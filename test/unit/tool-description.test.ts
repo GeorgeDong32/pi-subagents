@@ -10,7 +10,6 @@ import {
 	buildSubagentToolPromptMetadata,
 	COMPACT_SUBAGENT_TOOL_DESCRIPTION,
 	DEFAULT_SUBAGENT_TOOL_DESCRIPTION,
-	withLabelGuidance,
 	SUBAGENT_LABEL_GUIDANCE,
 	FULL_SUBAGENT_TOOL_DESCRIPTION,
 	SUBAGENT_SAFETY_GUIDANCE,
@@ -18,6 +17,17 @@ import {
 	SUBAGENT_TOOL_PROMPT_SNIPPET,
 } from "../../src/extension/tool-description.ts";
 import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
+
+// Surface tuning: label guidance lives inside every assembled description
+// (default/compact/full/custom); pin its presence and that the safety posture
+// stays the final section.
+function assertLabelGuidancePlacement(description: string): void {
+	assert.ok(description.includes(SUBAGENT_LABEL_GUIDANCE), "tool description must instruct the model to fill `label`");
+	assert.ok(
+		description.lastIndexOf(SUBAGENT_SAFETY_GUIDANCE) > description.lastIndexOf(SUBAGENT_LABEL_GUIDANCE),
+		"safety guidance must remain the final section after the label guidance",
+	);
+}
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -55,7 +65,9 @@ describe("registered subagent tool description", () => {
 	});
 
 	it("uses concise split metadata only by default", () => {
-		assert.equal(buildSubagentToolDescription(), withLabelGuidance(DEFAULT_SUBAGENT_TOOL_DESCRIPTION));
+		const defaultDescription = buildSubagentToolDescription();
+		assert.equal(defaultDescription, DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
+		assertLabelGuidancePlacement(defaultDescription);
 		const metadata = buildSubagentToolPromptMetadata();
 		assert.equal(SUBAGENT_TOOL_PROMPT_SNIPPET, "For operator-requested delegation, use subagents; compose multi-child work in one workflow call.");
 		assert.deepEqual(SUBAGENT_TOOL_PROMPT_GUIDELINES, [
@@ -74,12 +86,12 @@ describe("registered subagent tool description", () => {
 		for (const description of [DEFAULT_SUBAGENT_TOOL_DESCRIPTION, FULL_SUBAGENT_TOOL_DESCRIPTION, COMPACT_SUBAGENT_TOOL_DESCRIPTION]) {
 			for (const contract of [
 				/one child with \{agent,task\?\}/,
-				/exactly one of \{workflowScript,args\?\}, \{workflowScriptPath,args\?\} or \{workflow,args\}/,
-				/agent\/task exclude workflow inputs; task excludes action.*agent may target management actions/,
-				/workflowScriptPath loads from request cwd before sandbox/,
+				/Workflow script: write it as one ```js workflow block in this reply, then call subagent\(\{workflow:true,\.\.\.\}\)/,
+				/workflow:'\.\/path\.js' \(any value with '\/'\) loads a file from request cwd; other strings name a resource/,
+				/agent\/task exclude workflow; task excludes action.*agent may target management actions/,
 				/Raw-script sandboxes add deeply frozen args/,
 				/raw-script args persist as evidence, so never include secrets/,
-				/action is management\/control; validate accepts either script without launching/,
+				/action is management\/control; validate accepts workflow:true or a path without launching/,
 				/action:"list",capabilities:true.*executable, non-disabled.*runner.available === true/,
 				/Passive PATH\/PATHEXT\/X_OK.*not authentication\/version\/launch proof/,
 				/exactly one top-level subagent workflow call with async:true/,
@@ -95,7 +107,7 @@ describe("registered subagent tool description", () => {
 				/children.list is workflow-only, not an exhaustive list of direct native children.*exact run id.*action:"status",id.*status identifies the candidate.*action:"resume",id,message.*authoritatively checks eligibility, may reject it.*labeled same-role fallback only when no known candidate exists or resume rejects eligibility/,
 				/latest returned runId.*distinct resume pass needs a new stable key.*identical launch parameters/,
 				/Oracle\/advisor.*supervisor dialogue/,
-				/raw workflowScript\/workflowScriptPath cannot use runs.host/,
+				/raw scripts \(workflow:true or a path\) cannot use runs.host/,
 				/Granted commands\/relative outputs use workflow cwd, never per-step cwd/,
 				/worktree:true requires clean source.*baseRef defaults to HEAD at allocation.*named ref, never full 40\/64-character commit IDs or revision expressions/,
 				/External CLI agents support native options only when their runner declares them.*tool budget, fast, fork context/,
@@ -111,8 +123,12 @@ describe("registered subagent tool description", () => {
 	});
 
 	it("keeps full mode supplemental details and moves recipes to shipped guides", () => {
-		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "full" }), withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
-		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "compact" }), withLabelGuidance(COMPACT_SUBAGENT_TOOL_DESCRIPTION));
+		const fullDescription = buildSubagentToolDescription({ toolDescriptionMode: "full" });
+		const compactDescription = buildSubagentToolDescription({ toolDescriptionMode: "compact" });
+		assert.equal(fullDescription, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(compactDescription, COMPACT_SUBAGENT_TOOL_DESCRIPTION);
+		assertLabelGuidancePlacement(fullDescription);
+		assertLabelGuidancePlacement(compactDescription);
 		assert.ok(COMPACT_SUBAGENT_TOOL_DESCRIPTION.length < FULL_SUBAGENT_TOOL_DESCRIPTION.length);
 		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /runs.lanes.*structuredOutput.verdict === 'blocked'.*never reviewer prose/);
 		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /mission:false.*state.get.*state.set/);
@@ -225,7 +241,8 @@ describe("registered subagent tool description", () => {
 			{ cwd, agentDir, warn: (message) => warnings.push(message) },
 		);
 
-		assert.equal(description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
+		assert.equal(description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assertLabelGuidancePlacement(description);
 		assert.ok(warnings.some((message) => message.includes("using full description")));
 	});
 
@@ -237,7 +254,8 @@ describe("registered subagent tool description", () => {
 			{ warn: (message) => warnings.push(message) },
 		);
 
-		assert.equal(description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
+		assert.equal(description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assertLabelGuidancePlacement(description);
 		assert.ok(warnings.some((message) => message.includes("Ignoring invalid toolDescriptionMode")));
 	});
 
@@ -289,7 +307,8 @@ describe("registered subagent tool description", () => {
 		const defaultAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-default-"));
 		writeExtensionConfig(defaultAgentDir, {});
 		const defaultTool = readRegisteredTool(defaultAgentDir);
-		assert.equal(defaultTool.description, withLabelGuidance(DEFAULT_SUBAGENT_TOOL_DESCRIPTION));
+		assert.equal(defaultTool.description, DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
+		assertLabelGuidancePlacement(defaultTool.description);
 		assert.equal(defaultTool.properties.includes("step"), false);
 		assert.doesNotMatch(defaultTool.description, /append-step|approve-checkpoint|reject-checkpoint/);
 		assert.equal(defaultTool.promptSnippet, SUBAGENT_TOOL_PROMPT_SNIPPET);
@@ -298,14 +317,16 @@ describe("registered subagent tool description", () => {
 		const fullAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-full-"));
 		writeExtensionConfig(fullAgentDir, { toolDescriptionMode: "full" });
 		const fullTool = readRegisteredTool(fullAgentDir);
-		assert.equal(fullTool.description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
+		assert.equal(fullTool.description, FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assertLabelGuidancePlacement(fullTool.description);
 		assert.equal(fullTool.promptSnippet, undefined);
 		assert.equal(fullTool.promptGuidelines, undefined);
 
 		const compactAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-compact-"));
 		writeExtensionConfig(compactAgentDir, { toolDescriptionMode: "compact" });
 		const compactTool = readRegisteredTool(compactAgentDir);
-		assert.equal(compactTool.description, withLabelGuidance(COMPACT_SUBAGENT_TOOL_DESCRIPTION));
+		assert.equal(compactTool.description, COMPACT_SUBAGENT_TOOL_DESCRIPTION);
+		assertLabelGuidancePlacement(compactTool.description);
 		assert.equal(compactTool.promptSnippet, undefined);
 		assert.equal(compactTool.promptGuidelines, undefined);
 
@@ -318,10 +339,10 @@ describe("registered subagent tool description", () => {
 
 		const missingCustomAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-missing-"));
 		writeExtensionConfig(missingCustomAgentDir, { toolDescriptionMode: "custom" });
-		assert.equal(readRegisteredTool(missingCustomAgentDir).description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
+		assert.equal(readRegisteredTool(missingCustomAgentDir).description, FULL_SUBAGENT_TOOL_DESCRIPTION);
 
 		const invalidAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-invalid-"));
 		writeExtensionConfig(invalidAgentDir, { toolDescriptionMode: "tiny" });
-		assert.equal(readRegisteredTool(invalidAgentDir).description, withLabelGuidance(FULL_SUBAGENT_TOOL_DESCRIPTION));
+		assert.equal(readRegisteredTool(invalidAgentDir).description, FULL_SUBAGENT_TOOL_DESCRIPTION);
 	});
 });

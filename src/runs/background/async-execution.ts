@@ -17,6 +17,7 @@ import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { planChildLaunch, projectChainOutputSchemas, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
 import { formatHerdrMachineRunnerUnsupported, resolveHerdrMachinePlacement } from "../shared/herdr-machine.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/child-tool-plan.ts";
+import { assertClaudeCodeModelScope, isClaudeCodeAdapterId, resolveClaudeCodeOverride, type ClaudeCodeOverride } from "../shared/claude-code-adapter.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { applyWatchdogLaunchRules, sendRuleViolationWarning } from "../../watchdog/rules.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveExistingReadInstructionPaths, resolveExistingReadPaths, writeInitialProgressFile, type ChainStep, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
@@ -89,7 +90,7 @@ import { resolvePermissionRules, type PermissionConfig } from "../shared/permiss
 import { normalizeExtensionBindings, omitExtensionBindingsEnv, type ExtensionBindings } from "../shared/extension-bindings.ts";
 import { omitGitRoutingEnv } from "../shared/git-environment.ts";
 import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../shared/lane-metadata.ts";
-import { resolveRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
+import { assertRequiredChildExtensionsAdmitted, resolveRequiredChildExtensions, writeRetainedRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 const require = nodeModule.createRequire(import.meta.url);
 const piPackageRoot = resolveAsyncPiPackageRoot();
@@ -176,6 +177,7 @@ interface AsyncExecutionContext {
 	permissions?: PermissionConfig;
 	currentModelProvider?: string;
 	currentModel?: ParentModel;
+	scopedModelIds?: string[];
 	/** Optional model-scope enforcement resolved from subagent settings. */
 	modelScope?: ModelScopeConfig;
 	modelResponseAliases?: Record<string, string[]>;
@@ -183,6 +185,8 @@ interface AsyncExecutionContext {
 	interactive?: boolean;
 	/** The executor's own child runtime when the launch comes from an in-process child. */
 	childRuntime?: ChildRuntimeConfig;
+	/** The launching session's project trust; undefined when the host has no trust concept. */
+	projectTrusted?: boolean;
 }
 
 export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
@@ -244,6 +248,7 @@ interface AsyncChainParams {
 	/** Global cap on simultaneously-running subagent tasks within the async run. */
 	globalConcurrencyLimit?: number;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	thinkingCeiling?: ThinkingLevel;
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
 	parentWorkflowRunId?: string;
@@ -384,6 +389,8 @@ export interface AsyncRunnerStepBuildParams {
 	/** PI_SUBAGENT_TOOL_TIMEOUT_MS override (lowest precedence). */
 	toolTimeoutMsEnv?: string | undefined;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Retained snapshot from the launch being continued; takes precedence over the live registry, as in single launches. */
+	requiredExtensions?: RequiredChildExtensionSnapshot;
 	thinkingCeiling?: ThinkingLevel;
 }
 
@@ -873,6 +880,23 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	}
 }
 
+/**
+ * An explicit `thinking: false` clears the level, so only `undefined` falls
+ * through to the agent's own value. Treating `false` as absent would silently
+ * apply the agent default the caller just cleared.
+ */
+export function resolveClaudeCodeThinking(source: string | false | undefined, fallback: string | false | undefined): string | undefined {
+	const value = source === undefined ? fallback : source;
+	return typeof value === "string" ? value : undefined;
+}
+
+/** A pinned Claude Code model cannot survive pane-native saved-machine placement, which
+ * owns the remote model registry, so the combination fails instead of losing both flags. */
+export function assertClaudeCodeOverrideIsLocal(agent: string, machine: string | undefined, override: ClaudeCodeOverride | undefined): void {
+	if (!machine || !override) return;
+	throw new Error(`Agent '${agent}' requested machine '${machine}', but a Claude Code model or thinking level cannot be honored on a saved machine. Remove the model or thinking request, or run the agent locally.`);
+}
+
 function formatAsyncStartError(mode: SubagentRunMode, message: string): AsyncExecutionResult {
 	return {
 		content: [{ type: "text", text: message }],
@@ -978,6 +1002,12 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const externalRunnerType = a.runner?.type;
 		const machineUnsupported = formatHerdrMachineRunnerUnsupported({ machine: requestedMachine, agentName: a.name, runnerType: a.runner?.type, adapter: a.runner?.type === "external-cli" ? a.runner.adapter : undefined, worktree: s.worktree });
 		if (machineUnsupported) throw new AsyncStartValidationError(machineUnsupported);
+		const registeredExtensions = resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
+		try {
+			assertRequiredChildExtensionsAdmitted([params.requiredExtensions, ctx.childRuntime?.requiredExtensions, registeredExtensions], { agent: a.name, runnerType: a.runner?.type, machine: requestedMachine });
+		} catch (error) {
+			throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
+		}
 		let machine: HerdrMachineReference | undefined;
 		let machineEnv: Record<string, string> | undefined;
 		if (requestedMachine) {
@@ -989,9 +1019,12 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 			}
 		}
+		// A code-owned Claude Code adapter owns its argv, but it does accept an explicit
+		// model/thinking request; those become --model/--effort on the launch below.
+		const claudeCodeAdapter = a.runner?.type === "external-cli" && isClaudeCodeAdapterId(a.runner.adapter);
 		if (externalRunner) {
 			const unsupported: string[] = [];
-			if (s.model !== undefined) unsupported.push("model override");
+			if (s.model !== undefined && !claudeCodeAdapter) unsupported.push("model override");
 			if (effectiveBehavior.outputSchema !== undefined) unsupported.push("structured output");
 			if (s.acceptance !== undefined || params.agentContract !== undefined || s.agentContract !== undefined) unsupported.push("acceptance/agent contract");
 			if (s.toolBudget !== undefined || params.toolBudget !== undefined || a.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
@@ -1054,7 +1087,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const taskText = `${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`;
 		const task = namespaceOutputPath ? taskText : injectSingleOutputInstruction(taskText, outputPath, a);
 
-		const modelScopes = resolveModelScopesForAgent(ctx.modelScope, a.name, ctx.currentModel);
+		const modelScopes = resolveModelScopesForAgent(ctx.modelScope, a.name, ctx.currentModel, ctx.scopedModelIds);
 		const modelOrigin = resolveModelOrigin({ explicitModel: s.model, agentModel: a.model, parentModel: ctx.currentModel });
 		const primaryModelFromParent = modelOrigin === "inherited";
 		const primaryModel = externalRunner ? undefined : resolveEffectiveSubagentModel(
@@ -1066,6 +1099,23 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			{ scope: modelScopes, source: modelOrigin === "explicit" ? "explicit" : "inherited" },
 		);
 		const thinkingOverride = flatIndex === undefined ? undefined : thinkingOverridesByFlatIndex?.[flatIndex];
+		let claudeCodeOverride: ClaudeCodeOverride | undefined;
+		if (claudeCodeAdapter) {
+			try {
+				claudeCodeOverride = resolveClaudeCodeOverride({
+					model: typeof s.model === "string" ? s.model : undefined,
+					agent: a,
+					thinking: resolveClaudeCodeThinking(thinkingOverride, a.thinking),
+					thinkingCeiling: intersectThinkingCeilings(params.thinkingCeiling, a.maxThinking, ctx.childRuntime?.thinkingCeiling),
+					agentName: a.name,
+					runId: id,
+				});
+				assertClaudeCodeModelScope({ scopes: modelScopes, model: claudeCodeOverride?.model, agent: a.name, runId: id });
+				assertClaudeCodeOverrideIsLocal(a.name, machine ? requestedMachine : undefined, claudeCodeOverride);
+			} catch (error) {
+				throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
+			}
+		}
 		const effectiveThinking = externalRunner ? undefined : thinkingOverride ?? a.thinking;
 		const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, thinkingOverride !== undefined);
 		const contextLimit = model ? findModelInfo(model, availableModels, a.modelProvider ?? ctx.currentModelProvider)?.contextWindow : undefined;
@@ -1102,7 +1152,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const launchRuleError = applyWatchdogLaunchRules({ cwd: machine ? runnerCwd : stepCwd, agent: a.name, model: selectedModel, warn: (violation) => sendRuleViolationWarning(ctx.pi, violation) });
 		if (launchRuleError) throw new AsyncStartValidationError(launchRuleError);
 		const fast = s.fast ?? params.fast ?? a.fast;
-		const requiredExtensions = externalRunner ? [] : ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
+		const requiredExtensions = externalRunner ? [] : params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? registeredExtensions;
 		const toolPlan = resolvePiLaunchToolPlan({
 			tools: a.tools,
 			excludeTools: a.excludeTools,
@@ -1134,6 +1184,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			agent: s.agent,
 			task,
 			...(a.runner ? { runner: a.runner } : {}),
+			...(claudeCodeOverride ? { claudeCodeOverrideArgs: claudeCodeOverride.args } : {}),
 			...(machine ? { machine } : {}),
 			...(machineEnv ? { machineEnv } : {}),
 			...(params.contextForAgent ? { context: params.contextForAgent(s.agent) } : {}),
@@ -1162,6 +1213,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			subagentOnlyExtensions: a.subagentOnlyExtensions,
 			...(!externalRunner ? { requiredExtensions } : {}),
 			mcpDirectTools: a.mcpDirectTools,
+			...(toolPlan.builtinMcpTools ? { builtinMcpTools: toolPlan.builtinMcpTools } : {}),
 			mutationTools: a.mutationTools,
 			systemPrompt,
 			systemPromptMode: a.systemPromptMode,
@@ -1426,6 +1478,7 @@ export function executeAsyncChain(
 		toolTimeoutMsEnv: params.toolTimeoutMsEnv ?? toolTimeoutFromEnv(),
 		capabilityCeiling,
 		thinkingCeiling: params.thinkingCeiling,
+		requiredExtensions: params.requiredExtensions,
 	});
 	if ("error" in built) {
 		try {
@@ -1469,6 +1522,12 @@ export function executeAsyncChain(
 	const initialStatusAt = Date.now();
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
 	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
+	try {
+		writeRetainedRequiredChildExtensions(asyncDir, params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(launchParentSessionId ?? undefined));
+	} catch (error) {
+		fs.rmSync(asyncDir, { recursive: true, force: true });
+		return formatAsyncStartError(resultMode, `Failed to record required child extensions: ${error instanceof Error ? error.message : String(error)}`);
+	}
 
 	let spawnResult: SpawnRunnerResult = {};
 	try {
@@ -1491,6 +1550,7 @@ export function executeAsyncChain(
 				piPackageRoot,
 				childSessionFactoryModule: childSessionFactoryModule(),
 				inheritedChildRuntime: inheritedChildRuntime(ctx.childRuntime),
+				projectTrusted: ctx.projectTrusted,
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
@@ -1723,11 +1783,14 @@ export function executeAsyncSingle(
 	const externalRunner = agentConfig.runner?.type === "external-cli" || agentConfig.runner?.type === "external-job";
 	const externalRunnerType = agentConfig.runner?.type;
 	const permissionRules = resolvePermissionRules(ctx.permissions, agentConfig.permissions);
+	// See the chain path: the Claude Code adapter accepts an explicit model/thinking
+	// request even though no other external runner does.
+	const claudeCodeAdapter = agentConfig.runner?.type === "external-cli" && isClaudeCodeAdapterId(agentConfig.runner.adapter);
 	if (externalRunner) {
 		const unsupported: string[] = [];
-		if (params.modelOverride !== undefined) unsupported.push("model override");
+		if (params.modelOverride !== undefined && !claudeCodeAdapter) unsupported.push("model override");
 		if ((params.fast ?? agentConfig.fast) === true) unsupported.push("fast mode");
-		if (params.thinkingOverride !== undefined) unsupported.push("thinking override");
+		if (params.thinkingOverride !== undefined && !claudeCodeAdapter) unsupported.push("thinking override");
 		if (params.structuredOutputSchema !== undefined) unsupported.push("structured output");
 		if (params.acceptance !== undefined || params.agentContract !== undefined) unsupported.push("acceptance/agent contract");
 		if (params.toolBudget !== undefined || agentConfig.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
@@ -1747,6 +1810,12 @@ export function executeAsyncSingle(
 	const requestedMachine = params.machine ?? agentConfig.machine;
 	const machineUnsupported = formatHerdrMachineRunnerUnsupported({ machine: requestedMachine, agentName: agentConfig.name, runnerType: agentConfig.runner?.type, adapter: agentConfig.runner?.type === "external-cli" ? agentConfig.runner.adapter : undefined, worktree: params.worktree });
 	if (machineUnsupported) return formatAsyncStartError("single", machineUnsupported);
+	const registeredExtensions = resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
+	try {
+		assertRequiredChildExtensionsAdmitted([params.requiredExtensions, ctx.childRuntime?.requiredExtensions, registeredExtensions], { agent: agentConfig.name, runnerType: agentConfig.runner?.type, machine: requestedMachine });
+	} catch (error) {
+		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+	}
 	let machine: HerdrMachineReference | undefined;
 	let machineEnv: Record<string, string> | undefined;
 	if (requestedMachine) {
@@ -1826,7 +1895,7 @@ export function executeAsyncSingle(
 		? `[Read from: ${readPaths.join(", ")}]\n\n`
 		: "";
 	const taskText = readsInstruction + taskWithOutputInstruction;
-	const modelScopes = resolveModelScopesForAgent(ctx.modelScope, agentConfig.name, ctx.currentModel);
+	const modelScopes = resolveModelScopesForAgent(ctx.modelScope, agentConfig.name, ctx.currentModel, ctx.scopedModelIds);
 	const modelOrigin = resolveModelOrigin({
 		fromParent: params.modelOverrideFromParent,
 		storedOrigin: params.modelOrigin,
@@ -1847,6 +1916,23 @@ export function executeAsyncSingle(
 			);
 	} catch (error) {
 		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+	}
+	let singleClaudeCodeOverride: ClaudeCodeOverride | undefined;
+	if (claudeCodeAdapter) {
+		try {
+			singleClaudeCodeOverride = resolveClaudeCodeOverride({
+				model: typeof params.modelOverride === "string" ? params.modelOverride : undefined,
+				agent: agentConfig,
+				thinking: resolveClaudeCodeThinking(params.thinkingOverride, agentConfig.thinking),
+				thinkingCeiling: intersectThinkingCeilings(params.thinkingCeiling, agentConfig.maxThinking, ctx.childRuntime?.thinkingCeiling),
+				agentName: agentConfig.name,
+				runId: id,
+			});
+			assertClaudeCodeModelScope({ scopes: modelScopes, model: singleClaudeCodeOverride?.model, agent: agentConfig.name, runId: id });
+			assertClaudeCodeOverrideIsLocal(agentConfig.name, machine ? requestedMachine : undefined, singleClaudeCodeOverride);
+		} catch (error) {
+			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
+		}
 	}
 	const effectiveThinking = externalRunner ? undefined : params.thinkingOverride ?? agentConfig.thinking;
 	const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinking, params.thinkingOverride !== undefined);
@@ -1900,7 +1986,7 @@ export function executeAsyncSingle(
 			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 		}
 	}
-	const requiredExtensions = externalRunner ? [] : params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(ctx.parentSessionId ?? ctx.currentSessionId ?? undefined);
+	const requiredExtensions = externalRunner ? [] : params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? registeredExtensions;
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
 		excludeTools: agentConfig.excludeTools,
@@ -2026,6 +2112,7 @@ export function executeAsyncSingle(
 						agent,
 						task: taskText,
 						...(agentConfig.runner ? { runner: agentConfig.runner } : {}),
+						...(singleClaudeCodeOverride ? { claudeCodeOverrideArgs: singleClaudeCodeOverride.args } : {}),
 						...(machine ? { machine } : {}),
 						...(!externalRunner && machine && params.reads !== undefined ? { remoteReads: params.reads } : {}),
 						...(machineEnv ? { machineEnv } : {}),
@@ -2050,6 +2137,7 @@ export function executeAsyncSingle(
 						subagentOnlyExtensions: agentConfig.subagentOnlyExtensions,
 						...(!externalRunner ? { requiredExtensions } : {}),
 						mcpDirectTools: agentConfig.mcpDirectTools,
+						...(toolPlan.builtinMcpTools ? { builtinMcpTools: toolPlan.builtinMcpTools } : {}),
 						mutationTools: agentConfig.mutationTools,
 						systemPrompt,
 						systemPromptMode: agentConfig.systemPromptMode,
@@ -2095,6 +2183,7 @@ export function executeAsyncSingle(
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
 				childSessionFactoryModule: childSessionFactoryModule(),
+				projectTrusted: ctx.projectTrusted,
 				inheritedChildRuntime: inheritedChildRuntime(ctx.childRuntime),
 				worktreeSetupHook,
 				worktreeSetupHookTimeoutMs,
