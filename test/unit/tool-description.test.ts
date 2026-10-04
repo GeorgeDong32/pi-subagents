@@ -68,6 +68,7 @@ describe("registered subagent tool description", () => {
 		const defaultDescription = buildSubagentToolDescription();
 		assert.equal(defaultDescription, DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
 		assertLabelGuidancePlacement(defaultDescription);
+		assert.ok(defaultDescription.endsWith(SUBAGENT_SAFETY_GUIDANCE), "default description must end with the safety guidance");
 		const metadata = buildSubagentToolPromptMetadata();
 		assert.equal(SUBAGENT_TOOL_PROMPT_SNIPPET, "For operator-requested delegation, use subagents; compose multi-child work in one workflow call.");
 		assert.deepEqual(SUBAGENT_TOOL_PROMPT_GUIDELINES, [
@@ -160,6 +161,7 @@ describe("registered subagent tool description", () => {
 		assert.match(description, new RegExp(escapeRegex(agentDir)));
 		assert.match(description, new RegExp(escapeRegex(projectConfigDir)));
 		assert.match(description, /SAFETY-CRITICAL SUBAGENT GUIDANCE/);
+		assertLabelGuidancePlacement(description);
 		assert.equal(warnings.length, 0);
 	});
 

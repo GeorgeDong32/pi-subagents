@@ -112,3 +112,14 @@
 ## 8. Out of scope（重申）
 
 push origin、向上游提 PR、方案 A（preflight 摘要）、上游新功能（schedules/missions/worktree-cleanup）的深度调优、reply-block manifest 渲染。
+
+## 9. Known issues（对抗审查 Round 1 处置台账）
+
+- **P2-1（已修）**：custom 拼装点补 `assertLabelGuidancePlacement`，default 补 `endsWith(SAFETY)` 绝对序钉子；full 形态不适用 endsWith（上游 full 以 WORKFLOW DETAILS 结尾）。
+- **P3-1（记录不改）**：`workflow: false/数字` 会被拦进 workflow 分支渲染 `workflow false` 等文案——仅无效入参可达（executor 随后报错），SPEC 自标无害。
+- **P3-2（已修）**：删除 formatWorkflowManifest 注释中与实现不符的「color them apart」半句。
+- **P3-3（记录）**：renderCall 同步路径首帧/缓存 miss 遇 MB 级脚本会一次性阻塞 UI；现实脚本 KB 级，TTL 已限频。
+- **P3-4（记录）**：缓存逐出 FIFO 非 LRU；LIMIT 32 下无实际影响。
+- **P3-5（台账记录，fork 既有设计非本次引入）**：slash 白名单压制 `subagents/subagent-cost/subagents-fleet/subagents-models/subagents-inspect-rpc` 等注册，与 `test/integration/slash-commands.test.ts`（upstream 版）结构性冲突——依赖可解析环境下必 TypeError。本 fork 门禁只跑 `test:unit`（不含 integration），CI 仅 push main/PR 触发，当前照不到；后续若要跑 integration 需先决策白名单与 integration 的取舍。
+- **P3-6（记录）**：schemas 断言 13,070 = 实测 13,066 向上圆整，作 ratchet 用（红了即强制重测）。
+- **残余风险**：process.cwd() ≠ 会话 ctx.cwd() 时同名相对路径 manifest 可能读错文件（[R P2-1] 已接受）；三门禁（G2/G3）已在实施侧实跑通过（reviewer 无 shell 未复跑，属分工非缺口）。

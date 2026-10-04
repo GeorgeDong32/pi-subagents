@@ -389,7 +389,6 @@ function readWorkflowLanes(resolved: string): WorkflowLane[] | undefined {
 function formatWorkflowManifest(lanes: WorkflowLane[]): { head: string; body: string } | undefined {
 	// CC-style manifest — agent type + human task excerpt per lane; internal
 	// concepts (workflow/foreground/lanes/keys) stay in the expand layer.
-	// Returns {head, body} so the caller can color them apart.
 	if (lanes.length === 0) return undefined;
 	const describe = (lane: WorkflowLane): string => {
 		const text = typeof lane.task === "string" && lane.task.trim() ? lane.task : lane.key ?? "";
