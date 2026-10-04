@@ -123,3 +123,11 @@ push origin、向上游提 PR、方案 A（preflight 摘要）、上游新功能
 - **P3-5（台账记录，fork 既有设计非本次引入）**：slash 白名单压制 `subagents/subagent-cost/subagents-fleet/subagents-models/subagents-inspect-rpc` 等注册，与 `test/integration/slash-commands.test.ts`（upstream 版）结构性冲突——依赖可解析环境下必 TypeError。本 fork 门禁只跑 `test:unit`（不含 integration），CI 仅 push main/PR 触发，当前照不到；后续若要跑 integration 需先决策白名单与 integration 的取舍。
 - **P3-6（记录）**：schemas 断言 13,070 = 实测 13,066 向上圆整，作 ratchet 用（红了即强制重测）。
 - **残余风险**：process.cwd() ≠ 会话 ctx.cwd() 时同名相对路径 manifest 可能读错文件（[R P2-1] 已接受）；三门禁（G2/G3）已在实施侧实跑通过（reviewer 无 shell 未复跑，属分工非缺口）。
+- **P3-8（台账补记）**：上游测试 `renders the workflow source without reading the script`（index-child-registration.test.ts）的命名哲学与 fork 的 path-manifest 特性存在张力：它恰好钉住了文件不存在时的降级路径（负缓存→上游默认文案）；若未来上游在该测试 cwd 放置同名真文件，fork 的 manifest 渲染会改写文案而挂测试——同步时留意。
+
+## 10. G5 真机回归证据（2026-10-04，新代码活体验证）
+
+- ① 后台 subagent：headless `pi -p`（加载本工作树新代码）派 async delegate → headless turn 结束前交付（上游 #2666 行为）→ 回传 `headless-verify-ok` ✔
+- ② workflow reply-block：headless `pi -p` 写 ```js workflow fenced block + `subagent({workflow: true})` → 执行回传 `wf-verify-ok` ✔
+- ③ label call-row headline：真实注册流程 + `renderCall` 活体调用——`{label: "Verify rendering", async: true}` → `"subagent Verify rendering [async]"`（label 即整个 headline，无 agent 名/task 摘录）；无 label → `"subagent scout Inspect the seam"`；空白 label → 回落 `"subagent scout"` ✔
+- ④ fleet roster：`test/unit/fleet-status.test.ts`（fork 侧 238 行断言：roster 树/selection arrow/token spend/skeleton）+ fleet-transcript/widget-nested-render 于 G3 全量绿 ✔
