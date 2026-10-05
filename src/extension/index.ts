@@ -33,7 +33,8 @@ import { currentCompletionOwnerId } from "../shared/completion-owner.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
 import { clearLegacyResultAnimationTimer, renderSubagentResult, renderSubagentSummary, setInlineWorkflowCoverage } from "../tui/render.ts";
 import { getInspectorPlugins, registerInspectorEventListener } from "../inspectors/plugins.ts";
-import { SubagentFleetStatus, resolveFleetViewPlacement } from "../tui/fleet-status.ts";
+import { SubagentFleetStatus, drawNativeFleetFrame, resolveFleetViewPlacement } from "../tui/fleet-status.ts";
+import { PresentationSeamHost } from "../tui/presentation-seam.ts";
 import { readMainThinkingLevel, setMainThinkingLevelSource } from "../tui/running-tone.ts";
 import { createSubagentParamsSchema } from "./schemas.ts";
 import { resolveDisabledFeatureSurface } from "../shared/disabled-features.ts";
@@ -627,6 +628,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const resultDeliveryOwnership = createResultDeliveryOwnership(state);
 	const completionNotifier = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch, ownership: resultDeliveryOwnership });
 	let retainedNestedRouteTracker: ReturnType<typeof createRetainedNestedRouteTracker> | undefined;
+	// Presentation seam: owns adapter registration for surface drawing. The
+	// native adapter is the fleet renderer; CC-TUI (or any other presentation
+	// extension) registers through pi.events — see src/tui/presentation-seam.ts.
+	const presentationHost = new PresentationSeamHost({
+		events: pi.events,
+		session: () => state.currentSessionId,
+		native: fleetViewEnabled ? { fleet: drawNativeFleetFrame } : {},
+	});
 	const fleetStatus = fleetViewEnabled
 		? new SubagentFleetStatus(state, async (itemKey) => {
 			const ctx = withLastUiContext((current) => current);
@@ -641,7 +650,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 				}
 				throw error;
 			}
-		}, { placement: fleetViewPlacement, onWorkflowCoverageChange: setInlineWorkflowCoverage })
+		}, { placement: fleetViewPlacement, onWorkflowCoverageChange: setInlineWorkflowCoverage, seamDraw: (frame) => presentationHost.draw("fleet", frame).result })
 		: undefined;
 	let goalTurnId = 0;
 	let releaseHostSessionLiveness = () => {};
@@ -1246,6 +1255,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		primeExistingResults({ triggerTurn: !recovering });
 		logSlowPhase("result-prime", phaseStartedAt);
 		fleetStatus?.setContext(ctx);
+		// session_start is the seam activation point (TUI only): broadcasts
+		// readiness so late-loaded presentation extensions can register, and
+		// late probes get answered. Non-TUI never activates.
+		if (ctx.hasUI) presentationHost.activate(state.currentSessionId);
+		else presentationHost.deactivate();
 	};
 
 	let runtimeCleaned = false;
@@ -1280,6 +1294,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			supervisorChannel.dispose();
 			waitSubscriptionManager.dispose();
 			fleetStatus?.dispose();
+			presentationHost.dispose();
 			disposeAsyncJobTracker();
 			for (const timer of state.cleanupTimers.values()) clearTimeout(timer);
 			state.cleanupTimers.clear();
