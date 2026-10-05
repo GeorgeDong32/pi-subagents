@@ -12,6 +12,8 @@ import { inlineWorkflowRenderKey } from "./render.ts";
 import { runningTone } from "./running-tone.ts";
 import { childThinkingLevel, type ThinkingLevel } from "../shared/model-info.ts";
 import { formatWorkflowChecklistBottleneck, formatWorkflowChecklistPhase, formatWorkflowChecklistSummary, projectWorkflowChecklist, type WorkflowChecklistPhase, type WorkflowChecklistProjection } from "../workflows/workflow-checklist.ts";
+import type { PresentationAgentRow, PresentationDrawResult, PresentationFleetFrame, PresentationFleetRow, PresentationNestedRow, PresentationWorkflowLaneRow, PresentationWorkflowPhaseRow } from "./presentation-seam.ts";
+import { PRESENTATION_PROTOCOL_VERSION } from "./presentation-seam.ts";
 
 export const FLEET_STATUS_WIDGET_KEY = "subagent-fleet-status";
 
@@ -94,7 +96,7 @@ type FleetTreeRow =
 	| { kind: "owner"; entry: FleetStatusEntry }
 	| { kind: "child"; entry: FleetStatusEntry; last: boolean }
 	| { kind: "workflow-phase"; ownerKey: string; phase: WorkflowChecklistPhase; last: boolean }
-	| { kind: "workflow"; ownerKey: string; row: AsyncStatusWorkflowRow; last: boolean }
+	| { kind: "workflow"; ownerKey: string; row: AsyncStatusWorkflowRow; last: boolean; fullIndex?: number }
 	| { kind: "nested"; ownerKey: string; row: FleetNestedRow; last: boolean };
 
 export interface FleetStatusOptions {
@@ -102,6 +104,8 @@ export interface FleetStatusOptions {
 	maxAgentRows?: number;
 	placement?: FleetViewPlacement;
 	onWorkflowCoverageChange?: (ui: ExtensionContext["ui"], coverage: ReadonlyMap<string, string>) => void;
+	/** Presentation seam dispatcher; draws frames through the registered adapter with native fallback. */
+	seamDraw?: (frame: PresentationFleetFrame) => PresentationDrawResult;
 }
 
 export function resolveFleetViewPlacement(value: unknown): FleetViewPlacement {
@@ -162,6 +166,268 @@ function rightAlign(left: string, right: string, width: number): string {
 	return truncateToWidth(`${leftClamped}${" ".repeat(gap)}${right}`, width);
 }
 
+// ---- Presentation seam: native fleet drawing ---------------------------------
+//
+// The functions below are the native adapter: they consume a projected
+// PresentationFleetFrame and produce the exact bytes the inline renderer drew
+// before the seam existed. Byte-identity with the pre-seam renderer is pinned
+// by test/unit/fleet-status.test.ts; any visual change must stay a drawing
+// decision, never a state change.
+
+function frameDetailElapsed(row: { startedAt?: number; endedAt?: number; durationMs?: number; state: string }, now: number): string | undefined {
+	const duration = row.state === "running" && row.startedAt !== undefined
+		? now - row.startedAt
+		: row.durationMs ?? (row.startedAt !== undefined && row.endedAt !== undefined ? row.endedAt - row.startedAt : undefined);
+	return duration === undefined ? undefined : formatFleetElapsed(duration);
+}
+
+function laneRowGlyph(row: PresentationWorkflowLaneRow, theme: Theme): string {
+	if (!row.kind) return nestedStatusGlyph(row.state as FleetNestedRow["state"], theme, row.thinking as ThinkingLevel | undefined);
+	const state = row.state as HostStepState;
+	if (state === "pending") return theme.fg("muted", "◦");
+	if (state === "running") return theme.fg("accent", "●");
+	if (state === "done") return row.verdict === "pass" ? theme.fg("success", "✓") : row.verdict === "fail" ? theme.fg("error", "✗") : theme.fg("warning", "■");
+	if (state === "error") return theme.fg("error", "✗");
+	return theme.fg("warning", "■");
+}
+
+function laneRowStateLabel(row: PresentationWorkflowLaneRow, theme: Theme): string {
+	const state = row.kind ? hostStepVerdictLabel(row.state as HostStepState, row.verdict as HostStepVerdict | undefined) : row.state;
+	if (state === "running") return row.kind ? theme.fg("accent", state) : runningTone(theme, row.thinking as ThinkingLevel | undefined)(state);
+	if (state === "pending" || state === "queued") return theme.fg("muted", state);
+	if (state === "pass" || state === "complete" || state === "completed") return theme.fg("success", state === "pass" ? "pass" : "complete");
+	if (state === "fail" || state === "failed" || state === "error") return theme.fg("error", state === "fail" ? "fail" : state);
+	return theme.fg("warning", state);
+}
+
+function drawAgentRow(row: PresentationAgentRow, width: number, theme: Theme, now: number): { line: string; unclipped: string } {
+	const type = row.agentIdentity;
+	let label = row.label ?? "";
+	if (label.length > 20) label = `${label.slice(0, 19)}…`;
+	if (!label || label === type) label = "";
+	const elapsed = now - (row.startedAt ?? now);
+	const rightText = row.projectPane
+		? `${row.projectPane.summary ?? "—"} · ${formatFleetElapsed(now - row.projectPane.refreshedAt)} ago`
+		: row.workflowWrapperUsageOnChildren
+			? "usage on child rows"
+			: `${compactTokenCount(row.usage?.tokens ?? 0)}·${formatFleetElapsed(elapsed)}`;
+	const left = row.branch
+		? `${treeBranch(1, row.branch)}${rowGlyph(row.selected === true, "○", theme)} ${type}${label ? `  ${label}` : ""}`
+		: `${row.selected === true ? theme.fg("accent", "> ") : "  "}○ ${type}${label ? `  ${label}` : ""}`;
+	const right = theme.fg("dim", rightText);
+	const unclipped = `${left} ${right}`;
+	return { line: rightAlign(left, right, width), unclipped };
+}
+
+function drawLaneRow(row: PresentationWorkflowLaneRow, width: number, theme: Theme, now: number): { line: string; unclipped: string } {
+	if (row.overflow !== undefined) {
+		const line = truncateToWidth(`${treeBranch(1, row.branch)}${theme.fg("dim", `+${row.overflow} hidden workflow steps`)}`, width);
+		return { line, unclipped: line };
+	}
+	const context = contextModeLabel(row.context as Parameters<typeof contextModeLabel>[0]);
+	const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
+	const activity = row.activity ? ` · ${row.activity}` : "";
+	const kind = row.kind ? `${row.kind}: ` : "";
+	const hints = row.preflight ? [
+		row.preflight.mode ? `mode:${row.preflight.mode}` : undefined,
+		row.preflight.decision ? `decision:${row.preflight.decision}` : undefined,
+		row.preflight.claims?.length ? `claims:${row.preflight.claims.join(",")}` : undefined,
+		row.preflight.expectedOutput ? `expected:${row.preflight.expectedOutput}` : undefined,
+		row.preflight.independence ? `independence:${row.preflight.independence}` : undefined,
+	].filter((value): value is string => Boolean(value)).join(" · ") : "";
+	const left = `${treeBranch(1, row.branch)}${laneRowGlyph(row, theme)} ${theme.fg("muted", `${kind}${row.name}${context ? ` ${context}` : ""}${modelThinking}`)} · ${laneRowStateLabel(row, theme)}${activity}${hints ? ` · ${hints}` : ""}`;
+	const details = [
+		frameDetailElapsed(row, now),
+		row.usage?.tokens !== undefined ? formatFleetTokens(row.usage.tokens, row.usage.window) : undefined,
+		row.provider ? `provider:${row.provider}` : undefined,
+		row.role ? `role:${row.role}` : undefined,
+		row.target,
+		row.detail,
+		row.reasonCode ? `reason:${row.reasonCode}` : undefined,
+		row.freshness?.stale ? "stale" : row.freshness?.observedRef ? `ref:${row.freshness.observedRef}` : undefined,
+		row.reportPath ? `out:${hostStepReportName(row.reportPath)}` : undefined,
+	].filter(Boolean).join(" · ");
+	const unclipped = `${left}${details ? theme.fg("dim", ` · ${details}`) : ""}`;
+	return { line: truncateToWidth(unclipped, width), unclipped };
+}
+
+function drawPhaseRow(row: PresentationWorkflowPhaseRow, width: number, theme: Theme): { line: string; unclipped: string } {
+	const glyph = row.state === "complete"
+		? theme.fg("success", "✓")
+		: row.state === "running"
+			? runningTone(theme)("●")
+			: row.state === "blocked" || row.state === "failed"
+				? theme.fg("error", row.state === "blocked" ? "!" : "✗")
+					: row.state === "queued"
+						? theme.fg("muted", "◦")
+						: theme.fg("warning", "■");
+	const unclipped = `${treeBranch(1, row.branch)}${glyph} ${theme.fg("muted", row.text)}`;
+	return { line: truncateToWidth(unclipped, width), unclipped };
+}
+
+function drawNestedRow(row: PresentationNestedRow, width: number, theme: Theme, now: number): { line: string; unclipped: string } {
+	if (row.overflow !== undefined) {
+		const line = truncateToWidth(`${treeBranch(row.depth + 1, row.branch)}${theme.fg("dim", `+${row.overflow} nested leaves`)}`, width);
+		return { line, unclipped: line };
+	}
+	const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
+	const activity = row.activity ? ` · ${row.activity}` : "";
+	const left = `${treeBranch(row.depth + 1, row.branch)}${nestedStatusGlyph(row.state as FleetNestedRow["state"], theme, row.thinking as ThinkingLevel | undefined)} ${theme.fg(fleetAgentIdentityColor(row.agentIdentity ?? row.name), `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
+	const elapsed = frameDetailElapsed(row, now);
+	const tokens = row.usage?.tokens !== undefined ? ` · ${compactTokenCount(row.usage.tokens)} tok` : "";
+	const unclipped = `${left}${elapsed !== undefined ? theme.fg("dim", ` · ${elapsed}`) : ""}${theme.fg("dim", tokens)}`;
+	return { line: truncateToWidth(unclipped, width), unclipped };
+}
+
+// ---- Presentation seam: frame projection ------------------------------------
+// Entry → frame-row projections. Label resolution (displayLabel → runLabel →
+// workflowKey → description, redaction filtered) is projection; width budgets
+// are drawing decisions and stay in the adapters.
+
+function fleetAgentFrameRow(entry: FleetStatusEntry, selected: boolean, branch?: "├─" | "└─"): PresentationAgentRow {
+	let label = String(entry.displayLabel ?? entry.runLabel ?? entry.workflowKey ?? entry.description ?? "").replace(/\s+/g, " ").trim();
+	if (label === "[prompt redacted]") label = "";
+	return {
+		rowKind: "agent",
+		rowKey: entry.key,
+		...(entry.parentKey ? { parentKey: entry.parentKey } : {}),
+		...(branch ? { branch } : {}),
+		agentIdentity: entry.agent ?? "subagent",
+		...(label ? { label } : {}),
+		...(entry.modelThinking ? { modelThinking: entry.modelThinking } : {}),
+		state: entry.state,
+		usage: { tokens: entry.tokens, ...(entry.window !== undefined ? { window: entry.window } : {}) },
+		...(entry.workflowWrapper ? { workflowWrapperUsageOnChildren: true } : {}),
+		...(entry.projectPane ? { projectPane: { summary: entry.projectPane.summary, refreshedAt: entry.projectPane.refreshedAt } } : {}),
+		...(entry.external ? { external: true } : {}),
+		...(selected ? { selected: true } : {}),
+		startedAt: entry.startedAt,
+	};
+}
+
+function fleetLaneFrameRow(rowKey: string, ownerKey: string, row: AsyncStatusWorkflowRow, branch: "├─" | "└─", fullIndex?: number): PresentationWorkflowLaneRow {
+	return {
+		rowKind: "workflow-lane",
+		rowKey,
+		ownerKey,
+		branch,
+		...(row.kind ? { kind: row.kind } : {}),
+		name: row.name,
+		...(row.context !== undefined ? { context: row.context } : {}),
+		...(row.modelThinking ? { modelThinking: row.modelThinking } : {}),
+		...(row.thinking ? { thinking: row.thinking } : {}),
+		state: row.state,
+		...(row.verdict !== undefined ? { verdict: row.verdict } : {}),
+		...(row.activity ? { activity: row.activity } : {}),
+		...(row.preflight ? { preflight: {
+			...(row.preflight.mode ? { mode: row.preflight.mode } : {}),
+			...(row.preflight.decision ? { decision: row.preflight.decision } : {}),
+			...(row.preflight.claims?.length ? { claims: row.preflight.claims } : {}),
+			...(row.preflight.expectedOutput ? { expectedOutput: row.preflight.expectedOutput } : {}),
+			...(row.preflight.independence ? { independence: row.preflight.independence } : {}),
+		} } : {}),
+		...(row.tokens !== undefined ? { usage: { tokens: row.tokens, ...(row.window !== undefined ? { window: row.window } : {}) } } : {}),
+		...(row.startedAt !== undefined ? { startedAt: row.startedAt } : {}),
+		...(row.endedAt !== undefined ? { endedAt: row.endedAt } : {}),
+		...(row.durationMs !== undefined ? { durationMs: row.durationMs } : {}),
+		...(row.provider ? { provider: row.provider } : {}),
+		...(row.role ? { role: row.role } : {}),
+		...(row.target ? { target: row.target } : {}),
+		...(row.detail ? { detail: row.detail } : {}),
+		...(row.reasonCode ? { reasonCode: row.reasonCode } : {}),
+		...(row.freshness ? { freshness: {
+			...(row.freshness.stale ? { stale: true } : {}),
+			...(row.freshness.observedRef ? { observedRef: row.freshness.observedRef } : {}),
+		} } : {}),
+		...(row.reportPath ? { reportPath: row.reportPath } : {}),
+		...(row.overflow !== undefined ? { overflow: row.overflow } : {}),
+	};
+}
+
+function fleetPhaseFrameRow(rowKey: string, ownerKey: string, phase: WorkflowChecklistPhase, branch: "├─" | "└─"): PresentationWorkflowPhaseRow {
+	return {
+		rowKind: "workflow-phase",
+		rowKey,
+		ownerKey,
+		branch,
+		label: phase.label,
+		text: formatWorkflowChecklistPhase(phase),
+		state: phase.state,
+	};
+}
+
+function fleetNestedFrameRow(rowKey: string, ownerKey: string, row: FleetNestedRow, branch: "├─" | "└─"): PresentationNestedRow {
+	return {
+		rowKind: "nested",
+		rowKey,
+		ownerKey,
+		branch,
+		name: row.name,
+		...(row.agentIdentity ? { agentIdentity: row.agentIdentity } : {}),
+		state: row.state,
+		...(row.modelThinking ? { modelThinking: row.modelThinking } : {}),
+		...(row.thinking ? { thinking: row.thinking } : {}),
+		...(row.activity ? { activity: row.activity } : {}),
+		...(row.tokens !== undefined ? { usage: { tokens: row.tokens } } : {}),
+		depth: row.depth,
+		...(row.overflow !== undefined ? { overflow: row.overflow } : {}),
+		...(row.startedAt !== undefined ? { startedAt: row.startedAt } : {}),
+		...(row.endedAt !== undefined ? { endedAt: row.endedAt } : {}),
+	};
+}
+
+/**
+ * The native fleet adapter: renders a projected frame with the pre-seam
+ * inline rendering, byte for byte, and reports per-row layout facts (fit vs
+ * truncated) from the same pass the coverage decision consumes.
+ */
+export function drawNativeFleetFrame(frame: PresentationFleetFrame): PresentationDrawResult {
+	const theme = frame.theme as unknown as Theme;
+	const lines: string[] = [];
+	const layout: PresentationDrawResult["layout"] = [];
+	const push = (rowKey: string, produced: Array<{ line: string; unclipped: string } | string>): void => {
+		const from = lines.length;
+		for (const item of produced) lines.push(typeof item === "string" ? item : item.line);
+		const to = lines.length - 1;
+		const truncated = produced.some((item) => typeof item !== "string" && visibleWidth(item.unclipped) > frame.width);
+		layout.push({ rowKey, fromLine: from, toLine: to, truncated });
+	};
+	for (const row of frame.rows) {
+		switch (row.rowKind) {
+			case "main": {
+				const line = truncateToWidth(`${row.selected === true ? theme.fg("accent", "> ") : "  "}● main`, frame.width);
+				push(row.rowKey, [{ line, unclipped: line }]);
+				break;
+			}
+			case "overflow": {
+				const line = rightAlign("", theme.fg("dim", `${row.direction === "above" ? "↑" : "↓"} ${row.hidden} more`), frame.width);
+				push(row.rowKey, [{ line, unclipped: line }]);
+				break;
+			}
+			case "agent":
+				push(row.rowKey, [drawAgentRow(row, frame.width, theme, frame.now)]);
+				break;
+			case "workflow-lane":
+				push(row.rowKey, [drawLaneRow(row, frame.width, theme, frame.now)]);
+				break;
+			case "workflow-phase":
+				push(row.rowKey, [drawPhaseRow(row, frame.width, theme)]);
+				break;
+			case "nested":
+				push(row.rowKey, [drawNestedRow(row, frame.width, theme, frame.now)]);
+				break;
+			case "section-header": {
+				const header = truncateToWidth(`  ${theme.fg("dim", row.text)}`, frame.width);
+				const from = lines.length;
+				lines.push("", header);
+				layout.push({ rowKey: row.rowKey, fromLine: from, toLine: from + 1, truncated: false });
+				break;
+			}
+		}
+	}
+	return { lines, layout };
+}
+
 function isActiveState(value: string): boolean {
 	return value === "running" || value === "queued" || value === "pending";
 }
@@ -180,17 +446,18 @@ function nestedActivity(node: NestedRunSummary | NestedStepSummary): string | un
 	return undefined;
 }
 
-function visibleWorkflowRows(rows: AsyncStatusWorkflowRow[] | undefined, visibleLimit: number): AsyncStatusWorkflowRow[] {
+/** Indexed variant of visibleWorkflowRows so frame row keys stay stable. */
+function visibleWorkflowRowsIndexed(rows: AsyncStatusWorkflowRow[] | undefined, visibleLimit: number): Array<{ row: AsyncStatusWorkflowRow; fullIndex?: number }> {
 	if (!rows?.length) return [];
-	if (rows.length <= visibleLimit) return rows;
+	if (rows.length <= visibleLimit) return rows.map((row, index) => ({ row, fullIndex: index }));
 	const selected = new Set<number>();
 	for (const [index, row] of rows.entries()) {
 		if (!isWorkflowRowTerminal(row)) selected.add(index);
 		if (selected.size >= visibleLimit) break;
 	}
 	for (let index = rows.length - 1; index >= 0 && selected.size < visibleLimit; index--) selected.add(index);
-	const visible = [...selected].sort((left, right) => left - right).map((index) => rows[index]!);
-	return [{ name: `… +${rows.length - visible.length} hidden workflow steps`, state: "complete", overflow: rows.length - visible.length }, ...visible];
+	const visible = [...selected].sort((left, right) => left - right).map((index) => ({ row: rows[index]!, fullIndex: index }));
+	return [{ row: { name: `… +${rows.length - visible.length} hidden workflow steps`, state: "complete", overflow: rows.length - visible.length } }, ...visible];
 }
 
 function visibleWorkflowPhases(checklist: WorkflowChecklistProjection | undefined, visibleLimit: number): WorkflowChecklistPhase[] {
@@ -322,7 +589,7 @@ function fleetTreeRows(entries: FleetStatusEntry[]): FleetTreeRow[] {
 		rows.push({ kind: "owner", entry });
 		const attached = childrenByParent.get(entry.key) ?? [];
 		const workflowPhases = visibleWorkflowPhases(entry.workflowChecklist, attached.length > 0 ? 2 : 4);
-		const workflowRows = visibleWorkflowRows(entry.workflowRows, attached.length > 0 ? 2 : 4);
+		const workflowRows = visibleWorkflowRowsIndexed(entry.workflowRows, attached.length > 0 ? 2 : 4);
 		for (const [index, child] of attached.entries()) {
 			const nested = nestedFleetRows(child.nestedChildren, 3);
 			const laterRows = index < attached.length - 1 || workflowPhases.length > 0 || workflowRows.length > 0 || Boolean(entry.nestedChildren?.length);
@@ -340,7 +607,7 @@ function fleetTreeRows(entries: FleetStatusEntry[]): FleetTreeRow[] {
 			phase,
 			last: index === workflowPhases.length - 1 && workflowRows.length === 0 && !entry.nestedChildren?.length,
 		});
-		for (const [index, row] of workflowRows.entries()) rows.push({ kind: "workflow", ownerKey: entry.key, row, last: index === workflowRows.length - 1 && !entry.nestedChildren?.length });
+		for (const [index, { row, fullIndex }] of workflowRows.entries()) rows.push({ kind: "workflow", ownerKey: entry.key, row, last: index === workflowRows.length - 1 && !entry.nestedChildren?.length, ...(fullIndex !== undefined ? { fullIndex } : {}) });
 		const nested = nestedFleetRows(entry.nestedChildren, attached.length > 0 ? 3 : 4);
 		for (const [index, row] of nested.entries()) rows.push({ kind: "nested", ownerKey: entry.key, row, last: index === nested.length - 1 });
 	}
@@ -584,6 +851,7 @@ export class SubagentFleetStatus {
 	private entries: FleetStatusEntry[] = [];
 	private workflowSnapshots = new Map<string, { snapshot: string; childRows: Set<string> }>();
 	private readonly onWorkflowCoverageChange: FleetStatusOptions["onWorkflowCoverageChange"];
+	private readonly seamDraw: FleetStatusOptions["seamDraw"];
 	private readonly state: SubagentState;
 	private readonly openInspector: (itemKey: string) => Promise<void> | void;
 	private readonly refreshMs: number;
@@ -601,6 +869,7 @@ export class SubagentFleetStatus {
 		this.maxAgentRows = options.maxAgentRows ?? MAX_AGENT_ROWS;
 		this.placement = options.placement ?? "belowEditor";
 		this.onWorkflowCoverageChange = options.onWorkflowCoverageChange;
+		this.seamDraw = options.seamDraw;
 	}
 
 	setContext(ctx: ExtensionContext): void {
@@ -826,179 +1095,98 @@ export class SubagentFleetStatus {
 		// Surface tuning (CC parity): the roster renders expanded by default —
 		// a flat agent list under a `● main` row. The `active` flag now only
 		// gates interactive selection (↓/← , jk, enter), so key handling is
-		// unchanged.
-		const roster = this.rosterKeys();
-		const selectedIndex = Math.max(0, roster.indexOf(this.selectedKey));
-		const rosterIndexByKey = new Map<string, number>();
-		for (const [index, entry] of this.entries.entries()) {
-			if (!rosterIndexByKey.has(entry.key)) rosterIndexByKey.set(entry.key, index + 1);
-		}
-				// Surface tuning: fixed 2-char selection slot per row — the ●/○ column
-		// never shifts when the selection moves.
-		const lines = [truncateToWidth(`${this.active && selectedIndex === 0 ? theme.fg("accent", "> ") : "  "}● main`, width)];
-
+		// unchanged. Rendering projects a read-only PresentationFleetFrame and
+		// delegates drawing to the seam (native adapter by default); state,
+		// windowing, and coverage stay owned by this class.
 		const workEntries = this.entries.filter((entry) => !entry.surface);
 		const tree = fleetTreeRows(workEntries);
 		const selectedTreeIndex = Math.max(0, tree.findIndex((row) => (row.kind === "owner" || row.kind === "child") && row.entry.key === this.selectedKey));
 		const visibleCount = Math.min(this.maxAgentRows, tree.length);
 		const start = selectedTreeIndex < visibleCount ? 0 : selectedTreeIndex - visibleCount + 1;
 		const hiddenBelow = tree.length - (start + visibleCount);
-		if (start > 0 && tree.length > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), width));
-		for (let index = start; index < start + visibleCount; index++) {
+		const { frame, treeKeyByIndex } = this.buildFleetFrame(tree, { start, visibleCount, hiddenBelow }, width, theme);
+		const drawn = (this.seamDraw ?? drawNativeFleetFrame)(frame);
+		this.applyWorkflowCoverage(tree, { start, visibleCount }, treeKeyByIndex, drawn.layout);
+		return drawn.lines;
+	}
+
+	private buildFleetFrame(tree: FleetTreeRow[], window: { start: number; visibleCount: number; hiddenBelow: number }, width: number, theme: Theme): { frame: PresentationFleetFrame; treeKeyByIndex: Array<string | undefined> } {
+		const rows: PresentationFleetRow[] = [];
+		const treeKeyByIndex: Array<string | undefined> = new Array(tree.length).fill(undefined);
+		const nestedSeq = new Map<string, number>();
+		const isSelected = (key: string): boolean => this.active && this.selectedKey === key;
+		rows.push({ rowKind: "main", rowKey: "main", ...(isSelected("main") ? { selected: true } : {}) });
+		if (window.start > 0 && tree.length > 0) rows.push({ rowKind: "overflow", rowKey: "overflow:above", direction: "above", hidden: window.start });
+		for (let index = window.start; index < window.start + window.visibleCount; index++) {
 			const row = tree[index]!;
 			if (row.kind === "owner" || row.kind === "child") {
-				const rosterIndex = rosterIndexByKey.get(row.entry.key) ?? 0;
-				lines.push(this.renderEntry(rosterIndex, selectedIndex, row.entry, width, theme, row.kind === "child" ? (row.last ? "└─" : "├─") : undefined));
+				treeKeyByIndex[index] = row.entry.key;
+				rows.push(fleetAgentFrameRow(row.entry, isSelected(row.entry.key), row.kind === "child" ? (row.last ? "└─" : "├─") : undefined));
 			} else if (row.kind === "workflow") {
-				lines.push(this.renderWorkflowRow(row.row, row.last, width, theme));
+				const key = row.fullIndex !== undefined ? `${row.ownerKey}:wf:${row.fullIndex}` : `${row.ownerKey}:wf:overflow`;
+				treeKeyByIndex[index] = key;
+				rows.push(fleetLaneFrameRow(key, row.ownerKey, row.row, row.last ? "└─" : "├─", row.fullIndex));
 			} else if (row.kind === "workflow-phase") {
-				lines.push(this.renderWorkflowPhaseRow(row.phase, row.last, width, theme));
+				const key = `${row.ownerKey}:phase:${row.phase.key}`;
+				treeKeyByIndex[index] = key;
+				rows.push(fleetPhaseFrameRow(key, row.ownerKey, row.phase, row.last ? "└─" : "├─"));
 			} else {
-				lines.push(this.renderNestedRow(row.row, row.last, width, theme));
+				const seq = (nestedSeq.get(row.ownerKey) ?? 0) + 1;
+				nestedSeq.set(row.ownerKey, seq);
+				const key = `${row.ownerKey}:nested:${seq}`;
+				treeKeyByIndex[index] = key;
+				rows.push(fleetNestedFrameRow(key, row.ownerKey, row.row, row.last ? "└─" : "├─"));
 			}
 		}
-		if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), width));
-		if (this.ui && this.widgetRegistered && this.onWorkflowCoverageChange) {
-			const coverage = new Map<string, string>();
-			for (const [key, { snapshot, childRows }] of this.workflowSnapshots) {
-				const ownerIndex = tree.findIndex((row) => row.kind === "owner" && row.entry.key === key);
-				const owner = tree[ownerIndex];
-				if (owner?.kind !== "owner" || ownerIndex < start) continue;
-				const count = childRows.size + (owner.entry.workflowRows?.length ?? 0) + (owner.entry.workflowChecklist?.phases.length ?? 0);
-				if (!count || ownerIndex + count >= start + visibleCount) continue;
-				const descendants = tree.slice(ownerIndex + 1, ownerIndex + count + 1);
-				if (!descendants.every((row) => (row.kind === "workflow" && row.ownerKey === key && !row.row.overflow
-					&& visibleWidth(this.renderWorkflowRow(row.row, row.last, Infinity, theme)) <= width)
-					|| (row.kind === "workflow-phase" && row.ownerKey === key
-						&& visibleWidth(this.renderWorkflowPhaseRow(row.phase, row.last, Infinity, theme)) <= width)
-					|| (row.kind === "child" && childRows.has(row.entry.key)
-						&& visibleWidth(this.renderEntry(rosterIndexByKey.get(row.entry.key) ?? 0, selectedIndex, row.entry, 0, theme, row.last ? "└─" : "├─", true)) <= width))) continue;
-				if (childRows.size && visibleWidth(this.renderEntry(rosterIndexByKey.get(key) ?? 0, selectedIndex, owner.entry, 0, theme, undefined, true)) > width) continue;
-				coverage.set(key.slice("async:".length), snapshot);
-			}
-			this.onWorkflowCoverageChange(this.ui, coverage);
+		if (window.hiddenBelow > 0) rows.push({ rowKind: "overflow", rowKey: "overflow:below", direction: "below", hidden: window.hiddenBelow });
+		const panes = this.entries.filter((entry) => entry.surface === "project-pane");
+		if (panes.length) {
+			rows.push({ rowKind: "section-header", rowKey: "section:project-panes", text: "project panes" });
+			for (const entry of panes) rows.push(fleetAgentFrameRow(entry, isSelected(entry.key)));
 		}
-		this.renderProjectPaneSection(lines, selectedIndex, width, theme, rosterIndexByKey);
-		return lines;
+		return {
+			frame: {
+				protocol: PRESENTATION_PROTOCOL_VERSION,
+				surface: "fleet",
+				revision: this.getRenderKey(),
+				session: this.state.currentSessionId,
+				runtimeGeneration: 0,
+				width,
+				theme: theme as unknown as PresentationFleetFrame["theme"],
+				now: Date.now(),
+				rows,
+				selection: { active: this.active, selectedKey: this.selectedKey },
+				budget: { visibleRows: window.visibleCount, hiddenAbove: window.start, hiddenBelow: window.hiddenBelow, maxRows: this.maxAgentRows },
+			},
+			treeKeyByIndex,
+		};
 	}
 
-	private renderProjectPaneSection(lines: string[], selectedIndex: number, width: number, theme: Theme, rosterIndexByKey: ReadonlyMap<string, number>): void {
-		const entries = this.entries.filter((entry) => entry.surface === "project-pane");
-		if (!entries.length) return;
-		lines.push("", truncateToWidth(`  ${theme.fg("dim", "project panes")}`, width));
-		for (const entry of entries) {
-			const rosterIndex = rosterIndexByKey.get(entry.key) ?? 0;
-			lines.push(this.renderEntry(rosterIndex, selectedIndex, entry, width, theme));
+	private applyWorkflowCoverage(tree: FleetTreeRow[], window: { start: number; visibleCount: number }, treeKeyByIndex: ReadonlyArray<string | undefined>, layout: PresentationDrawResult["layout"]): void {
+		if (!this.ui || !this.widgetRegistered || !this.onWorkflowCoverageChange) return;
+		const truncatedByKey = new Map(layout.map((entry) => [entry.rowKey, entry.truncated]));
+		const fits = (treeIndex: number): boolean => truncatedByKey.get(treeKeyByIndex[treeIndex] ?? "") === false;
+		const coverage = new Map<string, string>();
+		for (const [key, { snapshot, childRows }] of this.workflowSnapshots) {
+			const ownerIndex = tree.findIndex((row) => row.kind === "owner" && row.entry.key === key);
+			const owner = tree[ownerIndex];
+			if (owner?.kind !== "owner" || ownerIndex < window.start) continue;
+			const count = childRows.size + (owner.entry.workflowRows?.length ?? 0) + (owner.entry.workflowChecklist?.phases.length ?? 0);
+			if (!count || ownerIndex + count >= window.start + window.visibleCount) continue;
+			const descendants = tree.slice(ownerIndex + 1, ownerIndex + count + 1);
+			// Coverage trusts the actual drawn layout: a row counts as shown only
+			// when its layout entry exists and reports an untruncated render.
+			if (!descendants.every((row, offset) => {
+				const treeIndex = ownerIndex + 1 + offset;
+				if (row.kind === "workflow") return row.ownerKey === key && row.row.overflow === undefined && fits(treeIndex);
+				if (row.kind === "workflow-phase") return row.ownerKey === key && fits(treeIndex);
+				if (row.kind === "child") return childRows.has(row.entry.key) && fits(treeIndex);
+				return false;
+			})) continue;
+			if (childRows.size && !fits(ownerIndex)) continue;
+			coverage.set(key.slice("async:".length), snapshot);
 		}
-	}
-
-
-	private renderEntry(rosterIndex: number, selectedIndex: number, entry: FleetStatusEntry, width: number, theme: Theme, branch?: string, unclipped = false): string {
-		// Surface tuning (CC parity, bottom agent list): `○ <type>  <label>`
-		// with elapsed right-aligned. State words, model, and token columns
-		// are dropped; the dot stays hollow (● would imply the main session).
-		// The selection marker (`>`) reappears once ↓/← enters selection mode.
-		const type = entry.agent ?? "subagent";
-		// Label = explicit displayLabel, else the run's task text (truncated).
-		// Redacted placeholders are skipped — containment strips task text
-		// from runner events, and "[prompt redacted]" is noise in a headline.
-		let label = String(entry.displayLabel ?? entry.runLabel ?? entry.workflowKey ?? entry.description ?? "").replace(/\s+/g, " ").trim();
-		if (label === "[prompt redacted]") label = "";
-		if (label.length > 20) label = `${label.slice(0, 19)}…`;
-		if (!label || label === type) label = "";
-		const elapsed = Date.now() - entry.startedAt;
-		// CC-compact right column: `tokens·time` (e.g. `8.1k·16s`).
-		const rightText = entry.projectPane
-			? `${entry.projectPane.summary ?? "—"} · ${formatFleetElapsed(Date.now() - entry.projectPane.refreshedAt)} ago`
-			: entry.workflowWrapper
-				? "usage on child rows"
-				: `${compactTokenCount(entry.tokens)}·${formatFleetElapsed(elapsed)}`;
-		// Child rows (workflow lanes etc.) keep their branch prefix so the
-		// tree nesting stays visible in the otherwise-flat CC list; the
-		// arrow replaces the dot in place, so branch rows stay tight.
-		const selected = this.active && rosterIndex === selectedIndex;
-		const left = branch
-			? `${treeBranch(1, branch)}${rowGlyph(selected, "○", theme)} ${type}${label ? `  ${label}` : ""}`
-			: `${selected ? theme.fg("accent", "> ") : "  "}○ ${type}${label ? `  ${label}` : ""}`;
-		const right = theme.fg("dim", rightText);
-		if (unclipped) return `${left} ${right}`;
-		return rightAlign(left, right, width);
-	}
-
-	private renderNestedRow(row: FleetNestedRow, last: boolean, width: number, theme: Theme): string {
-		// Nested rows live one level under their owner child entry (+1 depth).
-		if (row.overflow !== undefined) return truncateToWidth(`${treeBranch(row.depth + 1, last ? "└─" : "├─")}${theme.fg("dim", `+${row.overflow} nested leaves`)}`, width);
-		const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
-		const activity = row.activity ? ` · ${row.activity}` : "";
-		const left = `${treeBranch(row.depth + 1, last ? "└─" : "├─")}${nestedStatusGlyph(row.state, theme, row.thinking)} ${theme.fg(fleetAgentIdentityColor(row.agentIdentity ?? row.name), `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
-		const elapsed = detailElapsed(row);
-		// Surface tuning: show the child run's token spend once usage is reported.
-		const tokens = row.tokens !== undefined ? ` · ${compactTokenCount(row.tokens)} tok` : "";
-		return truncateToWidth(`${left}${elapsed !== undefined ? theme.fg("dim", ` · ${elapsed}`) : ""}${theme.fg("dim", tokens)}`, width);
-	}
-
-	private workflowRowGlyph(row: AsyncStatusWorkflowRow, theme: Theme): string {
-		if (!row.kind) return nestedStatusGlyph(row.state as FleetNestedRow["state"], theme, row.thinking);
-		const state = row.state as HostStepState;
-		if (state === "pending") return theme.fg("muted", "◦");
-		if (state === "running") return theme.fg("accent", "●");
-		if (state === "done") return row.verdict === "pass" ? theme.fg("success", "✓") : row.verdict === "fail" ? theme.fg("error", "✗") : theme.fg("warning", "■");
-		if (state === "error") return theme.fg("error", "✗");
-		return theme.fg("warning", "■");
-	}
-
-	private workflowRowStateLabel(row: AsyncStatusWorkflowRow, theme: Theme): string {
-		const state = row.kind ? hostStepVerdictLabel(row.state as HostStepState, row.verdict as HostStepVerdict | undefined) : row.state;
-		if (state === "running") return row.kind ? theme.fg("accent", state) : runningTone(theme, row.thinking)(state);
-		if (state === "pending" || state === "queued") return theme.fg("muted", state);
-		if (state === "pass" || state === "complete" || state === "completed") return theme.fg("success", state === "pass" ? "pass" : "complete");
-		if (state === "fail" || state === "failed" || state === "error") return theme.fg("error", state === "fail" ? "fail" : state);
-		return theme.fg("warning", state);
-	}
-
-	private renderWorkflowPhaseRow(phase: WorkflowChecklistPhase, last: boolean, width: number, theme: Theme): string {
-		const glyph = phase.state === "complete"
-			? theme.fg("success", "✓")
-			: phase.state === "running"
-				? runningTone(theme)("●")
-				: phase.state === "blocked" || phase.state === "failed"
-					? theme.fg("error", phase.state === "blocked" ? "!" : "✗")
-					: phase.state === "queued"
-						? theme.fg("muted", "◦")
-						: theme.fg("warning", "■");
-		return truncateToWidth(`${treeBranch(1, last ? "└─" : "├─")}${glyph} ${theme.fg("muted", formatWorkflowChecklistPhase(phase))}`, width);
-	}
-
-	private renderWorkflowRow(row: AsyncStatusWorkflowRow, last: boolean, width: number, theme: Theme): string {
-		if (row.overflow !== undefined) return truncateToWidth(`${treeBranch(1, last ? "└─" : "├─")}${theme.fg("dim", `+${row.overflow} hidden workflow steps`)}`, width);
-		const context = contextModeLabel(row.context);
-		const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
-		const activity = row.activity ? ` · ${row.activity}` : "";
-		const kind = row.kind ? `${row.kind}: ` : "";
-		const hints = row.preflight ? [
-			row.preflight.mode ? `mode:${row.preflight.mode}` : undefined,
-			row.preflight.decision ? `decision:${row.preflight.decision}` : undefined,
-			row.preflight.claims?.length ? `claims:${row.preflight.claims.join(",")}` : undefined,
-			row.preflight.expectedOutput ? `expected:${row.preflight.expectedOutput}` : undefined,
-			row.preflight.independence ? `independence:${row.preflight.independence}` : undefined,
-		].filter((value): value is string => Boolean(value)).join(" · ") : "";
-		const left = `${treeBranch(1, last ? "└─" : "├─")}${this.workflowRowGlyph(row, theme)} ${theme.fg("muted", `${kind}${row.name}${context ? ` ${context}` : ""}${modelThinking}`)} · ${this.workflowRowStateLabel(row, theme)}${activity}${hints ? ` · ${hints}` : ""}`;
-		const details = [
-			detailElapsed(row),
-			row.tokens !== undefined ? formatFleetTokens(row.tokens, row.window) : undefined,
-			row.provider ? `provider:${row.provider}` : undefined,
-			row.role ? `role:${row.role}` : undefined,
-			row.target,
-			row.detail,
-			row.reasonCode ? `reason:${row.reasonCode}` : undefined,
-			row.freshness?.stale ? "stale" : row.freshness?.observedRef ? `ref:${row.freshness.observedRef}` : undefined,
-			row.reportPath ? `out:${hostStepReportName(row.reportPath)}` : undefined,
-		].filter(Boolean).join(" · ");
-		return truncateToWidth(`${left}${details ? theme.fg("dim", ` · ${details}`) : ""}`, width);
-	}
-
-	private bullet(rosterIndex: number, selectedIndex: number, theme: Theme): string {
-		return rosterIndex === selectedIndex ? theme.fg("accent", ">") : " ";
+		this.onWorkflowCoverageChange(this.ui, coverage);
 	}
 
 	private rosterKeys(): string[] {
@@ -1056,7 +1244,7 @@ export class SubagentFleetStatus {
 						entry.workflowChecklist.failed,
 						entry.workflowChecklist.phases.map((phase) => [phase.key, phase.state, phase.done, phase.total, phase.running, phase.queued, phase.blocked, phase.failed, phase.items.map((item) => [item.key, item.state, item.currentTool, item.currentPath, item.durationMs, item.toolCount, item.error])]),
 					] : undefined,
-					visibleWorkflowRows(entry.workflowRows, entry.parentKey ? 2 : 4).map((row) => [
+					visibleWorkflowRowsIndexed(entry.workflowRows, entry.parentKey ? 2 : 4).map(({ row }) => [
 						row.kind,
 						row.name,
 						row.state,

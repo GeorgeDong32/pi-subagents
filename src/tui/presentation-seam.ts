@@ -72,15 +72,19 @@ export interface PresentationWorkflowLaneRow extends PresentationTiming, Present
 	rowKey: string;
 	ownerKey: string;
 	branch: "├─" | "└─";
+	/** Present only for typed host-owned monitor rows. */
 	kind?: string;
 	name: string;
 	context?: string;
 	modelThinking?: string;
+	thinking?: string;
 	state: string;
 	verdict?: string;
 	activity?: string;
 	preflight?: PresentationWorkflowPreflightHints;
 	usage?: PresentationUsage;
+	/** Set on the synthetic `+N hidden` row; such rows are never fully covered. */
+	overflow?: number;
 }
 
 export interface PresentationWorkflowPhaseRow {
@@ -88,10 +92,11 @@ export interface PresentationWorkflowPhaseRow {
 	rowKey: string;
 	ownerKey: string;
 	branch: "├─" | "└─";
+	/** Raw phase label. */
 	label: string;
-	/** e.g. `1 done · running · 1 queued`, already ordered upstream. */
-	counts?: string;
-	phaseGlyphKind: "active" | "queued" | "done" | "blocked" | "failed";
+	/** Pre-formatted `label · counts` display text from the checklist projection. */
+	text: string;
+	state: string;
 }
 
 export interface PresentationNestedRow extends PresentationTiming {
@@ -107,6 +112,8 @@ export interface PresentationNestedRow extends PresentationTiming {
 	activity?: string;
 	usage?: PresentationUsage;
 	depth: number;
+	/** Set on the synthetic `+N nested leaves` row. */
+	overflow?: number;
 }
 
 export interface PresentationAgentRow extends PresentationTiming {
@@ -125,10 +132,12 @@ export interface PresentationAgentRow extends PresentationTiming {
 	workflowWrapperUsageOnChildren?: boolean;
 	projectPane?: { summary?: string; refreshedAt: number };
 	external?: boolean;
+	/** True while interactive selection points at this row (provider-owned). */
+	selected?: boolean;
 }
 
 export type PresentationFleetRow =
-	| { rowKind: "main"; rowKey: "main" }
+	| { rowKind: "main"; rowKey: "main"; selected?: boolean }
 	| { rowKind: "overflow"; rowKey: string; direction: "above" | "below"; hidden: number }
 	| PresentationAgentRow
 	| PresentationWorkflowLaneRow
