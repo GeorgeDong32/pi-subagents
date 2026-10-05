@@ -93,8 +93,8 @@ describe("SubagentFleetStatus through the presentation seam", () => {
 		const { fleet, component } = mount(state, (frame) => host.draw("fleet", frame).result);
 		try {
 			const rendered = component.render(80).join("\n");
-			assert.match(rendered, /● main/);
-			assert.match(rendered, /○ reviewer/);
+			// Native roster (spec P5): collapsed summary while selection is off.
+			assert.match(rendered, /1 active agent · .+ · ↓\/← to inspect/);
 		} finally { fleet.dispose(); host.dispose(); }
 	});
 
@@ -120,10 +120,10 @@ describe("SubagentFleetStatus through the presentation seam", () => {
 			const rendered = component.render(80).join("\n");
 			assert.match(rendered, /CC:main/);
 			assert.match(rendered, /CC:reviewer/);
-			assert.doesNotMatch(rendered, /○ reviewer/);
+			assert.doesNotMatch(rendered, /active agent/);
 			registration.status === "activated" && registration.handle.dispose();
 			const afterWithdraw = component.render(80).join("\n");
-			assert.match(afterWithdraw, /○ reviewer/);
+			assert.match(afterWithdraw, /1 active agent/);
 			assert.doesNotMatch(afterWithdraw, /CC:reviewer/);
 		} finally { fleet.dispose(); host.dispose(); }
 	});
@@ -147,7 +147,7 @@ describe("SubagentFleetStatus through the presentation seam", () => {
 				},
 			});
 			const rendered = component.render(80).join("\n");
-			assert.match(rendered, /○ reviewer/, "invalid adapter layout must fall back to the native rows");
+			assert.match(rendered, /1 active agent/, "invalid adapter layout must fall back to the native roster");
 		} finally { fleet.dispose(); host.dispose(); }
 	});
 

@@ -3438,26 +3438,18 @@ export function renderSubagentSummary(
 		|| Boolean(details && workflowGraphHasStatus(details, ["failed"]));
 	const partial = Boolean(details && workflowGraphHasStatus(details, ["partial"]));
 	const state = running ? "running" : failed ? "failed" : stopped ? "stopped" : paused ? "paused" : partial ? "partial" : "completed";
-	// Surface tuning: in-flight rows ("single · running" / "workflow · running")
-	// are state noise — the call-row dot already carries state and live detail
-	// lives in the fleet roster. The summary row appears on completion
-	// (CC's "Done (…)" line), rendering zero lines while running.
-	if (state === "running") return new Text("", 0, 0);
-	// CC result-slot gutter: nest the completion line under the call row's
-	// ⎿ slot (same visual language as cctui's cc-rows and the notify renderer)
-	// instead of a bare parallel line.
-	const gutter = theme.fg("dim", "  ⎿  ");
-	const glyph = state === "completed"
-		? theme.fg("success", "✓")
-		: state === "failed"
-			? theme.fg("error", "✗")
-			: theme.fg("warning", "■");
+	const glyph = state === "running"
+		? runningTone(theme, details?.mode === "single" && results.length === 1 ? childThinkingLevel(results[0], results[0]?.progress) : undefined)(STATIC_RUNNING_GLYPH)
+		: state === "completed"
+			? theme.fg("success", "✓")
+			: state === "failed"
+				? theme.fg("error", "✗")
+				: theme.fg("warning", "■");
 	const label = details?.mode === "single" && results.length === 1
 		? foregroundSingleDisplayName(results[0])
-		// Surface tuning: "workflow" is an internal concept — plural agents reads better.
-		: details?.mode === "workflow" ? "subagents" : details?.mode || "subagent";
+		: details?.mode || "subagent";
 	return new Text(
-		truncLine(`${gutter}${glyph} ${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", "·")} ${theme.fg(state === "failed" ? "error" : state === "completed" ? "success" : "warning", state)}`, getTermWidth() - 4),
+		truncLine(`${glyph} ${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", "·")} ${theme.fg(state === "failed" ? "error" : state === "completed" ? "success" : state === "running" ? "accent" : "warning", state)}`, getTermWidth() - 4),
 		0,
 		0,
 	);

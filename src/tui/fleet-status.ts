@@ -201,19 +201,22 @@ function laneRowStateLabel(row: PresentationWorkflowLaneRow, theme: Theme): stri
 }
 
 function drawAgentRow(row: PresentationAgentRow, width: number, theme: Theme, now: number): { line: string; unclipped: string } {
-	const type = row.agentIdentity;
-	let label = row.label ?? "";
-	if (label.length > 20) label = `${label.slice(0, 19)}…`;
-	if (!label || label === type) label = "";
+	// Upstream-native roster row (spec P5): displayLabel (or agent) colored by
+	// agent identity, state word, checklist summary on workflow wrappers, and
+	// the full token format on the right.
+	const label = row.displayLabel ?? row.agentIdentity;
+	const agent = row.modelThinking ? `${label} (${row.modelThinking})` : label;
+	const prefix = row.branch ? `    ${row.branch}` : " ";
+	const checklist = row.checklistSummary !== undefined
+		? ` · checklist ${row.checklistSummary}${row.checklistBottleneck ? ` · bottleneck ${row.checklistBottleneck}` : ""}`
+		: "";
+	const left = `${prefix} ${rowGlyph(row.selected === true, " ", theme)} ${theme.fg(fleetAgentIdentityColor(row.agentIdentity), agent)} · ${row.state}${checklist}`;
 	const elapsed = now - (row.startedAt ?? now);
 	const rightText = row.projectPane
 		? `${row.projectPane.summary ?? "—"} · ${formatFleetElapsed(now - row.projectPane.refreshedAt)} ago`
-		: row.workflowWrapperUsageOnChildren
-			? "usage on child rows"
-			: `${compactTokenCount(row.usage?.tokens ?? 0)}·${formatFleetElapsed(elapsed)}`;
-	const left = row.branch
-		? `${treeBranch(1, row.branch)}${rowGlyph(row.selected === true, "○", theme)} ${type}${label ? `  ${label}` : ""}`
-		: `${row.selected === true ? theme.fg("accent", "> ") : "  "}○ ${type}${label ? `  ${label}` : ""}`;
+		: row.external
+			? formatFleetElapsed(elapsed)
+			: `${formatFleetElapsed(elapsed)} · ${row.workflowWrapperUsageOnChildren ? "usage on child rows" : formatFleetTokens(row.usage?.tokens ?? 0, row.usage?.window)}`;
 	const right = theme.fg("dim", rightText);
 	const unclipped = `${left} ${right}`;
 	return { line: rightAlign(left, right, width), unclipped };
@@ -302,6 +305,11 @@ function fleetAgentFrameRow(entry: FleetStatusEntry, selected: boolean, branch?:
 		...(entry.external ? { external: true } : {}),
 		...(selected ? { selected: true } : {}),
 		startedAt: entry.startedAt,
+		...(entry.displayLabel ? { displayLabel: entry.displayLabel } : {}),
+		...(entry.workflowWrapper && entry.workflowChecklist ? {
+			checklistSummary: formatWorkflowChecklistSummary(entry.workflowChecklist),
+			...(entry.workflowChecklist.bottleneck ? { checklistBottleneck: formatWorkflowChecklistBottleneck(entry.workflowChecklist.bottleneck) } : {}),
+		} : {}),
 	};
 }
 
@@ -382,6 +390,10 @@ function fleetNestedFrameRow(rowKey: string, ownerKey: string, row: FleetNestedR
  * truncated) from the same pass the coverage decision consumes.
  */
 export function drawNativeFleetFrame(frame: PresentationFleetFrame): PresentationDrawResult {
+	// Upstream-native roster (spec P5): collapsed one-line summary while
+	// interactive selection is off; help line + expanded tree when on. The
+	// CC look lives in the CC-TUI adapter — this is the fallback and the
+	// no-CC-TUI default.
 	const theme = frame.theme as unknown as Theme;
 	const lines: string[] = [];
 	const layout: PresentationDrawResult["layout"] = [];
@@ -392,10 +404,36 @@ export function drawNativeFleetFrame(frame: PresentationFleetFrame): Presentatio
 		const truncated = produced.some((item) => typeof item !== "string" && visibleWidth(item.unclipped) > frame.width);
 		layout.push({ rowKey, fromLine: from, toLine: to, truncated });
 	};
+	if (!frame.selection.active) {
+		// Collapsed summary — mirrors the pre-seam native roster line. No row
+		// layout entries: nothing in the tree is displayed, so coverage stays
+		// empty (equivalent to the upstream early-return clear).
+		const summary = frame.summary;
+		const nativeUsage = formatFleetTokens(summary.nativeUsage.tokens, summary.nativeUsage.window, summary.nativeUsage.count);
+		const showNativeSummary = summary.nativeUsage.count > 0 || summary.hasWorkflowWrapper || (summary.capacity?.used ?? 0) > 0;
+		const asyncRuns = summary.capacity && showNativeSummary && (summary.capacity.used > 0 || summary.capacity.limit > 0)
+			? `Async runs ${summary.capacity.used}/${summary.capacity.limit || "∞"}`
+			: "";
+		const noun = summary.anyExternal ? "job" : "agent";
+		const agents = summary.activeLeafAgents > 0 ? `${summary.activeLeafAgents} active ${noun}${summary.activeLeafAgents === 1 ? "" : "s"}` : "";
+		const panes = summary.panes.total > 0 ? `${summary.panes.total} pane${summary.panes.total === 1 ? "" : "s"}${summary.panes.attention ? ` (${summary.panes.attention} ⚠)` : ""}` : "";
+		const label = [agents, asyncRuns, panes].filter(Boolean).join(" · ");
+		const usage = summary.hasWorkflowWrapper
+			? summary.nativeUsage.count > 0 ? `standalone: ${nativeUsage} · workflow usage on child rows` : "usage on child rows"
+			: nativeUsage;
+		const detail = [showNativeSummary ? usage : undefined, "↓/← to inspect"].filter(Boolean).join(" · ");
+		lines.push(truncateToWidth(`  ${theme.fg("muted", label)}${label && detail ? " · " : ""}${theme.fg("dim", detail)}`, frame.width));
+		layout.push({ rowKey: "native:summary", fromLine: 0, toLine: 0, truncated: false });
+		return { lines, layout };
+	}
+	// Expanded: upstream help line + blank separator, then the roster.
+	lines.push(truncateToWidth(`  ${theme.fg("dim", "↑↓/jk select · enter inspect · esc back")}`, frame.width));
+	lines.push("");
+	layout.push({ rowKey: "native:help", fromLine: 0, toLine: 1, truncated: false });
 	for (const row of frame.rows) {
 		switch (row.rowKind) {
 			case "main": {
-				const line = truncateToWidth(`${row.selected === true ? theme.fg("accent", "> ") : "  "}● main`, frame.width);
+				const line = truncateToWidth(`  ${rowGlyph(row.selected === true, " ", theme)} main`, frame.width);
 				push(row.rowKey, [{ line, unclipped: line }]);
 				break;
 			}
@@ -417,9 +455,8 @@ export function drawNativeFleetFrame(frame: PresentationFleetFrame): Presentatio
 				push(row.rowKey, [drawNestedRow(row, frame.width, theme, frame.now)]);
 				break;
 			case "section-header": {
-				const header = truncateToWidth(`  ${theme.fg("dim", row.text)}`, frame.width);
 				const from = lines.length;
-				lines.push("", header);
+				lines.push("", truncateToWidth(`  ${theme.fg("dim", row.text)}`, frame.width));
 				layout.push({ rowKey: row.rowKey, fromLine: from, toLine: from + 1, truncated: false });
 				break;
 			}
@@ -1144,6 +1181,11 @@ export class SubagentFleetStatus {
 			rows.push({ rowKind: "section-header", rowKey: "section:project-panes", text: "project panes" });
 			for (const entry of panes) rows.push(fleetAgentFrameRow(entry, isSelected(entry.key)));
 		}
+		// Native collapsed-summary material (upstream roster semantics).
+		const workEntries = this.entries.filter((entry) => !entry.surface);
+		const nativeEntries = workEntries.filter((entry) => !entry.external && !entry.workflowWrapper && !entry.parentKey);
+		const capacity = this.state.activeAsyncCapacity;
+		const projectEntries = this.entries.filter((entry) => entry.surface === "project-pane");
 		return {
 			frame: {
 				protocol: PRESENTATION_PROTOCOL_VERSION,
@@ -1157,6 +1199,23 @@ export class SubagentFleetStatus {
 				rows,
 				selection: { active: this.active, selectedKey: this.selectedKey },
 				budget: { visibleRows: window.visibleCount, hiddenAbove: window.start, hiddenBelow: window.hiddenBelow, maxRows: this.maxAgentRows },
+				summary: {
+					activeLeafAgents: activeLeafAgentCount(workEntries),
+					anyExternal: workEntries.some((entry) => entry.external),
+					...(capacity ? { capacity: { used: capacity.used, limit: capacity.limit } } : {}),
+					nativeUsage: {
+						tokens: nativeEntries.reduce((total, entry) => total + entry.tokens, 0),
+						...(nativeEntries.length > 0 && nativeEntries.every((entry) => entry.window !== undefined)
+							? { window: nativeEntries.reduce((total, entry) => total + entry.window!, 0) }
+							: {}),
+						count: nativeEntries.length,
+					},
+					hasWorkflowWrapper: workEntries.some((entry) => entry.workflowWrapper),
+					panes: {
+						total: projectEntries.length,
+						attention: projectEntries.filter((entry) => entry.projectPane && projectPaneNeedsAttention(entry.projectPane)).length,
+					},
+				},
 			},
 			treeKeyByIndex,
 		};

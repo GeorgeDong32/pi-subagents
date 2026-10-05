@@ -134,6 +134,12 @@ export interface PresentationAgentRow extends PresentationTiming {
 	external?: boolean;
 	/** True while interactive selection points at this row (provider-owned). */
 	selected?: boolean;
+	/** Raw displayLabel material (pre-resolution) — native drawing uses `displayLabel ?? agent`. */
+	displayLabel?: string;
+	/** Pre-formatted workflow checklist summary for wrapper rows (native drawing). */
+	checklistSummary?: string;
+	/** Pre-formatted workflow checklist bottleneck for wrapper rows (native drawing). */
+	checklistBottleneck?: string;
 }
 
 export type PresentationFleetRow =
@@ -158,11 +164,24 @@ export interface PresentationFrameBase {
 	now: number;
 }
 
+/** Collapsed-summary material for the native roster (spec P5: native keeps
+ * the upstream one-line summary when interactive selection is off). */
+export interface PresentationFleetSummary {
+	activeLeafAgents: number;
+	anyExternal: boolean;
+	capacity?: { used: number; limit: number };
+	nativeUsage: { tokens: number; window?: number; count: number };
+	hasWorkflowWrapper: boolean;
+	panes: { total: number; attention: number };
+}
+
 export interface PresentationFleetFrame extends PresentationFrameBase {
 	surface: "fleet";
 	rows: PresentationFleetRow[];
 	selection: { active: boolean; selectedKey: string | null };
 	budget: { visibleRows: number; hiddenAbove: number; hiddenBelow: number; maxRows: number };
+	/** Native collapsed-summary material (CC adapters may ignore). */
+	summary: PresentationFleetSummary;
 }
 
 export type PresentationFrame = PresentationFleetFrame;

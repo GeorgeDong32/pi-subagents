@@ -155,178 +155,6 @@ function logSlowPhase(label: string, startedAt: number): void {
 	if (elapsed >= SLOW_RELOAD_PHASE_MS) console.error(`Subagent reload phase '${label}' took ${elapsed}ms.`);
 }
 
-type WorkflowLane = { key?: string; agent?: string; task?: string };
-
-function workflowLaneKeys(script: string): WorkflowLane[] {
-	// Surface tuning: collect {key, agent, task} per runs.all lane object so the
-	// call row can render human task descriptions instead of internal lane keys.
-	const lanes: WorkflowLane[] = [];
-	let currentLane: WorkflowLane = {};
-	const setProp = (name: "key" | "agent" | "task", value: string): void => {
-		if (value !== undefined) currentLane[name] = value;
-	};
-	const pushLane = (): void => {
-		if (Object.keys(currentLane).length > 0) lanes.push(currentLane);
-		currentLane = {};
-	};
-	const isIdentifier = (char: string | undefined): boolean => char !== undefined && /[\w$]/.test(char);
-	const skipTrivia = (start: number): number => {
-		let index = start;
-		while (index < script.length) {
-			if (/\s/.test(script[index]!)) index += 1;
-			else if (script.startsWith("//", index)) {
-				const end = script.indexOf("\n", index + 2);
-				index = end === -1 ? script.length : end + 1;
-			} else if (script.startsWith("/*", index)) {
-				const end = script.indexOf("*/", index + 2);
-				index = end === -1 ? script.length : end + 2;
-			} else break;
-		}
-		return index;
-	};
-	const readLiteral = (start: number): { key?: string; end: number } | undefined => {
-		const quote = script[start];
-		if (quote !== "'" && quote !== '"' && quote !== "`") return undefined;
-		let index = start + 1;
-		let dynamicTemplate = false;
-		while (index < script.length) {
-			if (script[index] === "\\") {
-				index += 2;
-				continue;
-			}
-			if (quote === "`" && script.startsWith("${", index)) dynamicTemplate = true;
-			if (script[index] === quote) return { key: dynamicTemplate ? undefined : script.slice(start + 1, index), end: index + 1 };
-			if (quote !== "`" && /[\r\n]/.test(script[index]!)) return { end: index + 1 };
-			index += 1;
-		}
-		return { end: script.length };
-	};
-
-	const collectRunsAllKeys = (start: number): number => {
-		let index = skipTrivia(start);
-		if (script[index] !== "(") return start;
-		index = skipTrivia(index + 1);
-		if (script[index] !== "[") return start;
-		let arrayDepth = 1;
-		let objectDepth = 0;
-		let directChildObject = false;
-		let expectingElement = true;
-		for (index += 1; index < script.length; index += 1) {
-			index = skipTrivia(index);
-			const literal = readLiteral(index);
-			if (literal) {
-				index = literal.end - 1;
-				continue;
-			}
-			if (script[index] === "[") {
-				arrayDepth += 1;
-				expectingElement = false;
-				continue;
-			}
-			if (script[index] === "]") {
-				arrayDepth -= 1;
-				if (arrayDepth === 0) return index + 1;
-				continue;
-			}
-			if (script[index] === "{") {
-				objectDepth += 1;
-				if (objectDepth === 1) directChildObject = arrayDepth === 1 && expectingElement;
-				expectingElement = false;
-				continue;
-			}
-			if (script[index] === "}") {
-				objectDepth -= 1;
-				if (objectDepth === 0) {
-					if (directChildObject) pushLane();
-					directChildObject = false;
-				}
-				continue;
-			}
-			if (script[index] === "," && arrayDepth === 1 && objectDepth === 0) {
-				expectingElement = true;
-				continue;
-			}
-			if (directChildObject && objectDepth === 1 && !isIdentifier(script[index - 1])) {
-				const prop = (["key", "agent", "task"] as const).find((name) => script.startsWith(name, index) && !isIdentifier(script[index + name.length]));
-				if (prop) {
-					const colon = skipTrivia(index + prop.length);
-					const literal = script[colon] === ":" ? readLiteral(skipTrivia(colon + 1)) : undefined;
-					if (literal) {
-						const next = skipTrivia(literal.end);
-						if (literal.key !== undefined && (script[next] === "," || script[next] === "}")) setProp(prop, literal.key);
-						index = literal.end - 1;
-					}
-				}
-			}
-		}
-		return index;
-	};
-
-	for (let index = 0; index < script.length;) {
-		index = skipTrivia(index);
-		const literal = readLiteral(index);
-		if (literal) {
-			index = literal.end;
-			continue;
-		}
-		if (!isIdentifier(script[index - 1]) && script.startsWith("runs.run", index) && !isIdentifier(script[index + 8])) {
-			const open = skipTrivia(index + 8);
-			const key = script[open] === "(" ? readLiteral(skipTrivia(open + 1)) : undefined;
-			if (key) {
-				const next = skipTrivia(key.end);
-				if (key.key !== undefined && (script[next] === "," || script[next] === ")")) {
-					setProp("key", key.key);
-					if (script[next] === ",") {
-						// runs.run("key", { agent, task }) — scan the second-arg
-						// object literal for top-level agent/task strings.
-						const objStart = skipTrivia(next + 1);
-						if (script[objStart] === "{") {
-							let depth = 0;
-							for (let k = objStart; k < script.length; k += 1) {
-								const lit = readLiteral(k);
-								if (lit) {
-									k = lit.end - 1;
-									continue;
-								}
-								if (script[k] === "{") {
-									depth += 1;
-									continue;
-								}
-								if (script[k] === "}") {
-									depth -= 1;
-									if (depth === 0) break;
-									continue;
-								}
-								if (depth === 1 && !isIdentifier(script[k - 1])) {
-									const prop = (["agent", "task"] as const).find((name) => script.startsWith(name, k) && !isIdentifier(script[k + name.length]));
-									if (prop) {
-										const colon = skipTrivia(k + prop.length);
-										const lit2 = script[colon] === ":" ? readLiteral(skipTrivia(colon + 1)) : undefined;
-										if (lit2 && lit2.key !== undefined) {
-											const after = skipTrivia(lit2.end);
-											if (script[after] === "," || script[after] === "}") setProp(prop, lit2.key);
-											k = lit2.end - 1;
-										}
-									}
-								}
-							}
-						}
-					}
-					pushLane();
-				}
-				index = key.end;
-				continue;
-			}
-		}
-		if (!isIdentifier(script[index - 1]) && script.startsWith("runs.all", index) && !isIdentifier(script[index + 8])) {
-			index = collectRunsAllKeys(index + 8);
-			continue;
-		}
-		index += 1;
-	}
-	return lanes;
-}
-
 function formatWorkflowPreflightCall(input: unknown): string {
 	if (input === undefined) return "";
 	try {
@@ -336,73 +164,6 @@ function formatWorkflowPreflightCall(input: unknown): string {
 	}
 }
 
-// Surface tuning: path-form workflow scripts get a CC-style manifest — agent
-// type + human task excerpt per lane. Reply-block workflows keep the upstream
-// "workflow (reply block)" row: the script is already visible in the reply
-// text right above the call.
-interface WorkflowManifestCacheEntry {
-	until: number;
-	mtimeMs: number;
-	lanes: WorkflowLane[] | undefined;
-}
-const workflowManifestCache = new Map<string, WorkflowManifestCacheEntry>();
-const WORKFLOW_MANIFEST_CACHE_LIMIT = 32;
-const WORKFLOW_MANIFEST_HIT_TTL_MS = 500;
-const WORKFLOW_MANIFEST_MISS_TTL_MS = 5_000;
-
-function trimWorkflowManifestCache(): void {
-	while (workflowManifestCache.size > WORKFLOW_MANIFEST_CACHE_LIMIT) {
-		const oldest = workflowManifestCache.keys().next().value;
-		if (oldest === undefined) break;
-		workflowManifestCache.delete(oldest);
-	}
-}
-
-/** Read a path-form workflow script and parse its lanes, with stat throttling,
- * negative caching, and a bounded cache so render-time redraws stay cheap. */
-function readWorkflowLanes(resolved: string): WorkflowLane[] | undefined {
-	const now = Date.now();
-	const cached = workflowManifestCache.get(resolved);
-	if (cached && now < cached.until) return cached.lanes;
-	let mtimeMs: number;
-	try {
-		mtimeMs = fs.statSync(resolved).mtimeMs;
-	} catch {
-		workflowManifestCache.set(resolved, { until: now + WORKFLOW_MANIFEST_MISS_TTL_MS, mtimeMs: 0, lanes: undefined });
-		trimWorkflowManifestCache();
-		return undefined;
-	}
-	if (cached && cached.mtimeMs === mtimeMs && cached.lanes !== undefined) {
-		cached.until = now + WORKFLOW_MANIFEST_HIT_TTL_MS;
-		return cached.lanes;
-	}
-	let lanes: WorkflowLane[] | undefined;
-	try {
-		lanes = workflowLaneKeys(fs.readFileSync(resolved, "utf-8"));
-	} catch {
-		lanes = undefined;
-	}
-	workflowManifestCache.set(resolved, { until: now + (lanes === undefined ? WORKFLOW_MANIFEST_MISS_TTL_MS : WORKFLOW_MANIFEST_HIT_TTL_MS), mtimeMs, lanes });
-	trimWorkflowManifestCache();
-	return lanes;
-}
-
-function formatWorkflowManifest(lanes: WorkflowLane[]): { head: string; body: string } | undefined {
-	// CC-style manifest — agent type + human task excerpt per lane; internal
-	// concepts (workflow/foreground/lanes/keys) stay in the expand layer.
-	if (lanes.length === 0) return undefined;
-	const describe = (lane: WorkflowLane): string => {
-		const text = typeof lane.task === "string" && lane.task.trim() ? lane.task : lane.key ?? "";
-		const clean = text.replace(/\s+/g, " ").trim();
-		return clean.length > 28 ? `${clean.slice(0, 27)}…` : clean;
-	};
-	const agents = [...new Set(lanes.map((lane) => lane.agent).filter((agent): agent is string => typeof agent === "string" && agent !== ""))];
-	if (lanes.length === 1) return { head: agents[0] ?? "agent", body: describe(lanes[0]!) };
-	const head = agents.length === 1 ? `${lanes.length}×${agents[0]}` : agents.length > 1 ? agents.join("+") : `${lanes.length} agents`;
-	const visible = lanes.slice(0, 2).map(describe).join(" · ");
-	const remainder = lanes.length > 2 ? ` · +${lanes.length - 2}` : "";
-	return { head, body: `${visible}${remainder}` };
-}
 /**
  * Derive subagent session base directory from parent session file.
  * If parent session is ~/.pi/agent/sessions/abc123.jsonl,
@@ -981,49 +742,21 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			const gap = " ".repeat(config.mainWindowRenderer?.horizontalSpacing ?? 1);
 			const title = theme.fg("toolTitle", theme.bold("subagent"));
 			if (args.action) {
-				// Surface tuning: show agent name, else run-id prefix, so control
-				// rows like `status` are no longer a bare keyword.
-				const target = args.agent || (typeof args.id === "string" ? args.id.slice(0, 8) : "");
+				const target = args.agent || "";
 				return new Text(
-					`${title}${gap}${args.action}${target ? `${gap}${theme.fg("dim", target)}` : ""}`,
+					`${title}${gap}${args.action}${target ? `${gap}${theme.fg("accent", target)}` : ""}`,
 					0, 0,
 				);
 			}
-			if (args.workflow !== undefined) {
-				// Surface tuning: path-form workflows render a CC-style manifest
-				// (agent + task excerpt per lane); reply-block and named-resource
-				// workflows keep the upstream row. Remote (machine) launches skip
-				// file reads — the path cannot be resolved locally.
-				const isReplyBlock = args.workflow === true || args.workflow === "true";
-				let manifest: { head: string; body: string } | undefined;
-				if (!isReplyBlock && typeof args.workflow === "string" && isWorkflowScriptPath(args.workflow) && args.machine === undefined) {
-					const resolved = path.resolve(process.cwd(), typeof args.cwd === "string" ? args.cwd : ".", args.workflow);
-					const lanes = readWorkflowLanes(resolved);
-					if (lanes !== undefined) manifest = formatWorkflowManifest(lanes);
-				}
-				const head = isReplyBlock ? "workflow (reply block)" : manifest ? manifest.head : `workflow ${String(args.workflow)}`;
+			if (args.workflow !== undefined)
 				return new Text(
-					`${title}${gap}${theme.fg("accent", head)}${manifest?.body ? `${gap}${manifest.body}` : ""}${args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : ""}${args.preflight !== undefined ? `${gap}${theme.fg("dim", formatWorkflowPreflightCall(args.preflight))}` : ""}`,
+					`${title}${gap}${theme.fg("accent", args.workflow === true || args.workflow === "true" ? "workflow (reply block)" : `workflow ${String(args.workflow)}`)}${args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : ""}${args.preflight !== undefined ? `${gap}${theme.fg("dim", formatWorkflowPreflightCall(args.preflight))}` : ""}`,
 					0,
 					0,
 				);
-			}
-			// Surface tuning (CC parity, UI.tsx:411): a model-written short
-			// label is the whole headline — no agent name, no task excerpt.
-			const descText = typeof args.label === "string" ? args.label.replace(/\s+/g, " ").trim() : "";
-			if (descText)
-				return new Text(
-					`${title}${gap}${descText}${args.async === true ? `${gap}${theme.fg("dim", "[async]")}` : ""}`,
-					0,
-					0,
-				);
-			// Humanized default call row: agent + explicit model (dim) + [async] (dim) + task excerpt.
-			const asyncLabel = args.async === true ? `${gap}${theme.fg("dim", "[async]")}` : "";
-			const modelLabel = typeof args.model === "string" && args.model ? `${gap}${theme.fg("dim", args.model)}` : "";
-			const taskText = typeof args.task === "string" ? args.task.replace(/\s+/g, " ").trim() : "";
-			const taskLabel = taskText ? `${gap}${taskText.length > 60 ? `${taskText.slice(0, 57)}…` : taskText}` : "";
+			const asyncLabel = args.async === true ? `${gap}${theme.fg("warning", "[async]")}` : "";
 			return new Text(
-				`${title}${gap}${theme.fg("accent", args.agent || "?")}${modelLabel}${asyncLabel}${taskLabel}`,
+				`${title}${gap}${theme.fg("accent", args.agent || "?")}${asyncLabel}`,
 				0,
 				0,
 			);

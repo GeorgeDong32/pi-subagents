@@ -136,14 +136,16 @@ describe("below-editor subagent FleetView", () => {
 				for (const totalTokens of [undefined, usage]) {
 					state.asyncJobs.set(workflow.asyncId, { ...workflow, totalTokens });
 					fleet.refresh();
-					const rendered = component.render(240).join("\n");
-					// Expanded-by-default roster: the wrapper row carries the usage
-					// note; per-row usage is the compact tokens·time column.
-					assert.match(rendered, /usage on child rows/);
-					assert.doesNotMatch(rendered, /0 tokens|238\.4k/);
-					const wrapper = rendered.split("\n").find((line) => line.includes("workflow"))!;
+					const compact = component.render(240).join("\n");
+					assert.match(compact, /usage on child rows/);
+					assert.doesNotMatch(compact, /0 tokens|238\.4k|window|spent/);
+					fleet.handleKey("\x1b[B");
+					const expanded = component.render(400).join("\n");
+					const wrapper = expanded.split("\n").find((line) => line.includes("workflow · running"))!;
 					assert.match(wrapper, /usage on child rows/);
-					assert.doesNotMatch(wrapper, /window|spent/);
+					assert.doesNotMatch(wrapper, /tokens|window|spent/);
+					assert.equal(expanded.match(/118\.9k window · 119\.2k spent/g)?.length, 1);
+					fleet.handleKey("\x1b");
 				}
 			}
 		} finally { fleet.dispose(); }
@@ -168,12 +170,9 @@ describe("below-editor subagent FleetView", () => {
 		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
 		try {
 			fleet.setContext({ hasUI: true, ui: { setWidget() {}, theme } } as unknown as ExtensionContext);
-			const rendered = fleet.render(240, theme as unknown as ExtensionContext["ui"]["theme"]).join("\n");
-			// Unrelated native usage stays on its own row, never summed into the
-			// workflow wrapper's "usage on child rows" note.
-			assert.match(rendered, /usage on child rows/);
-			assert.match(rendered, /○ worker/);
-			assert.doesNotMatch(rendered, /standalone:|Σ windows|280\.4k/);
+			const compact = fleet.render(240, theme as unknown as ExtensionContext["ui"]["theme"]).join("\n");
+			assert.match(compact, /standalone: ↓ 30\.0k window · 42\.0k spent · workflow usage on child rows/);
+			assert.doesNotMatch(compact, /119\.2k|161\.2k|280\.4k|Σ windows/);
 		} finally { fleet.dispose(); }
 	});
 
@@ -186,10 +185,7 @@ describe("below-editor subagent FleetView", () => {
 		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
 		try {
 			fleet.setContext({ hasUI: true, ui: { setWidget() {}, theme } } as unknown as ExtensionContext);
-			const rendered = fleet.render(240, theme as unknown as ExtensionContext["ui"]["theme"]).join("\n");
-			// Each foreground row carries its own tokens·time; no Σ aggregation.
-			assert.equal(rendered.match(/○ worker/g)?.length, 2);
-			assert.doesNotMatch(rendered, /Σ windows/);
+			assert.match(fleet.render(240, theme as unknown as ExtensionContext["ui"]["theme"]).join("\n"), /180\.0k Σ windows · 240\.0k spent/);
 		} finally { fleet.dispose(); }
 	});
 
@@ -260,10 +256,14 @@ describe("below-editor subagent FleetView", () => {
 			fleet.setContext(ctx);
 			const tui = { requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor };
 			const component = widgetFactory!(tui, theme);
-			const rendered = component.render(80).join("\n");
-			assert.match(rendered, /external · Dependency review/);
-			assert.match(rendered, /11s/);
-			assert.doesNotMatch(rendered, /tokens/);
+			const compact = component.render(80)[0]!;
+			assert.match(compact, /1 active job/);
+			assert.doesNotMatch(compact, /Async runs|tokens/);
+			fleet.handleKey("\x1b[B");
+			const expanded = component.render(80).join("\n");
+			assert.match(expanded, /external · Dependency review · running/);
+			assert.match(expanded, /11s/);
+			assert.doesNotMatch(expanded.split("\n").find((line) => line.includes("Dependency review"))!, /tokens/);
 		} finally {
 			fleet.dispose();
 			clearExternalRuns();
@@ -339,27 +339,36 @@ describe("below-editor subagent FleetView", () => {
 				focusedComponent: Object.create(Editor.prototype) as Editor,
 			};
 			const component = widgetFactory!(tui, theme);
-			// Expanded-by-default roster: one row per foreground run plus the
-			// main row; capacity is no longer rendered.
-			const lines = component.render(80);
-			assert.equal(lines[0]!.includes("● main"), true);
-			let workerRows = 0;
-			for (const line of lines) if (line.includes("worker-")) workerRows += 1;
-			assert.equal(workerRows, 6); // maxAgentRows bounds the visible roster; one folds into "↓ 1 more"
-			for (const line of lines) assert.ok(visibleWidth(line) <= 80, `line exceeded width: ${line}`);
-			assert.ok(lines.join("\n").includes("↓ 1 more"), "overflow marker renders");
+			const compactLines = component.render(80);
+			assert.equal(compactLines.length, 1);
+			assert.ok(compactLines[0]!.includes("7 active agents · Async runs 2/4"));
+			assert.ok(compactLines[0]!.includes("↓ 13.7k tokens"));
+			assert.ok(compactLines[0]!.includes("↓/← to inspect"));
+			assert.ok(visibleWidth(compactLines[0]!) <= 80);
 
+			state.activeAsyncCapacity = { used: 0, limit: 0 };
+			const unlimitedIdleSummary = component.render(80)[0]!;
+			assert.match(unlimitedIdleSummary, /7 active agents/);
+			assert.doesNotMatch(unlimitedIdleSummary, /Async runs 0\/∞/);
+			state.activeAsyncCapacity = { used: 2, limit: 0 };
+			assert.match(component.render(80)[0]!, /Async runs 2\/∞/);
+			state.activeAsyncCapacity = { used: 0, limit: 4 };
+			assert.match(component.render(80)[0]!, /Async runs 0\/4/);
+			state.activeAsyncCapacity = { used: 2, limit: 4 };
+
+			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const expandedLines = component.render(80);
-			assert.ok(expandedLines.some((line) => line.includes("  ● main")), "unselected main uses blank focus space");
-			assert.ok(expandedLines.some((line) => line.includes("worker-0")), "rows keep the agent type column");
-			assert.ok(expandedLines.some((line) => line.includes("13.1k·")), "tokens·time column survives");
-			// Surface tuning (CC parity): fleet rows intentionally use ●/○ circle
-			// glyphs (the user-approved look); the old ambiguity guard is retired.
-			assert.ok(expandedLines.some((line) => /[●○]/u.test(line)), "CC circle glyphs render on roster rows");
+			assert.ok(expandedLines.some((line) => line.includes("> main")));
+			assert.ok(expandedLines.some((line) => line.includes("  worker-0")), "unselected agents use blank focus space");
+			assert.ok(expandedLines.every((line) => !/[⏺◯]/u.test(line)), "selection avoids terminal-ambiguous circle glyphs");
+			assert.ok(expandedLines.some((line) => line.includes("worker-0 (fable-5 · thinking low)")));
+			assert.ok(expandedLines.some((line) => line.includes("11s · ↓ 13.1k tokens")));
+			assert.ok(expandedLines.some((line) => line.includes("↓ 1 more")));
 			for (const line of expandedLines) assert.ok(visibleWidth(line) <= 80, `line exceeded width: ${line}`);
 
-			assert.equal(fleet.handleKey("\x1b"), undefined, "esc while inactive is a no-op");
-			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true }, "↓ activates the roster");
+			assert.deepEqual(fleet.handleKey("\x1b"), { consume: true });
+			assert.equal(component.render(80).length, 1);
+			assert.deepEqual(fleet.handleKey("\x1b[D"), { consume: true });
 			assert.ok(component.render(80).length > 1, "Left should also expand the roster");
 		} finally {
 			fleet.dispose();
@@ -410,9 +419,8 @@ describe("below-editor subagent FleetView", () => {
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(160);
 			const colorFor = (label: string) => lines.find((line) => line.includes(label))?.match(new RegExp(`⟦(\\w+)⟧${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`))?.[1];
-			// Surface tuning (CC parity): fleet rows drop identity colors — labels render plain.
-assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
-			assert.ok(lines.some((line) => line.includes("Audit API (scout)")));
+			assert.equal(colorFor("Find seams (scout)"), colorFor("Audit API (scout)"));
+			assert.equal(colorFor("Find seams (scout)"), fleetAgentIdentityColor("scout"));
 		} finally {
 			fleet.dispose();
 		}
@@ -437,11 +445,7 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 		try {
 			fleet.setContext(ctx);
 			assert.ok(widgetFactory);
-						// Surface tuning: capacity alone renders only the main row (no
-			// agent rows, no totals).
-			const rendered = widgetFactory!({ requestRender() {} }, theme).render(80).filter((line) => line.trim() !== "");
-			assert.equal(rendered.length, 1);
-			assert.ok(rendered[0]!.includes("● main"));
+			assert.deepEqual(widgetFactory!({ requestRender() {} }, theme).render(80), ["  Async runs 1/2 · ↓ 0 tokens · ↓/← to inspect"]);
 		} finally {
 			fleet.dispose();
 		}
@@ -474,11 +478,10 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 		try {
 			fleet.setContext(ctx);
 			const lines = widgetFactory!({ requestRender() {} }, theme).render(50);
-			// Surface tuning: queued runs render as their own type-only row.
-			assert.equal(lines.length, 2);
-			assert.ok(lines[0]!.includes("● main"));
-			assert.ok(lines[1]!.includes("single"));
-			assert.ok(visibleWidth(lines[1]!) <= 50);
+			assert.equal(lines.length, 1);
+			assert.ok(lines[0]!.includes("1 active agent"));
+			assert.ok(lines[0]!.includes("↓ 30 window · 42 spent"));
+			assert.ok(visibleWidth(lines[0]!) <= 50);
 		} finally {
 			fleet.dispose();
 		}
@@ -567,11 +570,8 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			fleet.setContext(ctx);
 			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, theme);
 			const compact = component.render(100)[0]!;
-			// Surface tuning: panes render as rows in the expanded-by-default roster.
-			const expandedNow = component.render(100).join("\n");
-			assert.match(expandedNow, /peer-project · w1:p50/);
-			assert.match(expandedNow, /worker needs attention/);
-			
+			assert.match(compact, /1 active agent/);
+			assert.match(compact, /1 pane \(1 ⚠\)/);
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const expanded = component.render(100).join("\n");
 			assert.match(expanded, /project panes/);
@@ -845,8 +845,7 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			fleet.setContext(ctx);
 			const tui = { requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor };
 			const component = widgetFactory!(tui, theme);
-						// Surface tuning: the roster is expanded by default; nested leaves
-			// render under their owner without a separate activation step.
+			assert.equal(component.render(120).length, 1, "nested activity should stay compact until navigation activates the roster");
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(120).join("\n");
 			assert.match(lines, /supervisor/);
@@ -915,7 +914,7 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			fleet.setContext(ctx);
 			const tui = { requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor };
 			const component = widgetFactory!(tui, theme);
-						// Surface tuning: expanded by default (see above).
+			assert.equal(component.render(120).length, 1, "parallel nested activity should stay compact until activated");
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(120).join("\n");
 			for (const index of [0, 1, 2, 3]) assert.match(lines, new RegExp(`child-a-${index}`));
@@ -1092,14 +1091,15 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 		try {
 			fleet.setContext(ctx);
 			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, theme);
-			const renderedEarly = component.render(120).join("\n");
-			assert.match(renderedEarly, /○ workflow/, "workflow wrapper renders as its own row");
+			const compact = component.render(120);
+			assert.match(compact[0]!, /2 active agents/, "workflow wrappers must not be counted as leaf agents");
+			assert.doesNotMatch(compact[0]!, /3 active agents/);
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(120);
-			const workflowIndex = lines.findIndex((line) => line.includes("○ workflow"));
-			const childIndex = lines.findIndex((line) => line.includes("○ reviewer"));
+			const workflowIndex = lines.findIndex((line) => line.includes("workflow · running"));
+			const childIndex = lines.findIndex((line) => line.includes("reviewer · running"));
 			const nestedIndex = lines.findIndex((line) => line.includes("nested-reviewer"));
-			const secondChildIndex = lines.findIndex((line) => line.includes("○ tester"));
+			const secondChildIndex = lines.findIndex((line) => line.includes("tester · running"));
 			const secondNestedIndex = lines.findIndex((line) => line.includes("nested-tester"));
 			const ownerNestedIndex = lines.findIndex((line) => line.includes("owner-nested"));
 			assert.ok(workflowIndex >= 0 && childIndex > workflowIndex && nestedIndex > childIndex);
@@ -1296,19 +1296,10 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			const component = widgetFactory!({ requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor }, theme);
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(140).join("\n");
-			assert.match(lines, /○ workflow/);
-			assert.match(lines, /usage on child rows/);
+			assert.match(lines, /workflow · running/);
 			assert.match(lines, /Plan: scan · Find seams \(scout\) \[fresh\] \(gpt-5\.6-luna · thinking max\) · complete/);
 			assert.match(lines, /Review: review \(reviewer\) \[fork\] · running · tool grep/);
 			assert.match(lines, /Verify: test \(tester\) · pending/);
-			// Row-grid pin: every same-depth row (workflow rows, checklist phase
-			// rows) shares the branch skeleton `indent + branch + glyph` with a
-			// single space — glyph columns never drift between row kinds.
-			const rendered = component.render(140);
-			assert.match(rendered.find((line) => line.includes("Review: review"))!, /^ {4}├─ ● Review: review/);
-			const phaseLine = rendered.find((line) => /^\s{4}[├└]─/.test(line) && /· (\d )?running/.test(line));
-			assert.ok(phaseLine, "checklist phase row renders");
-			assert.match(phaseLine!, /^ {4}[├└]─ /);
 		} finally {
 			fleet.dispose();
 		}
@@ -1518,88 +1509,10 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			const component = widgetFactory!(tui, theme);
 			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
 			const lines = component.render(180);
-			assert.ok(lines.some((line) => line.includes("reviewer")));
+			assert.ok(lines.some((line) => line.includes("reviewer (gpt-5 · thinking medium)")));
 			assert.ok(lines.some((line) => line.includes("worker")));
-			// Surface tuning: task excerpts now render as row labels (truncated).
-			assert.ok(lines.some((line) => line.includes("Review only authent")));
-			assert.ok(lines.some((line) => line.includes("Implement only bill")));
-			assert.ok(lines.some((line) => line.includes("4.2k·")));
-		} finally {
-			fleet.dispose();
-		}
-	});
-
-	it("puts the selection arrow inside the tree and shows nested child token spend", () => {
-		const state = stateForTest();
-		state.asyncJobs.set("workflow-1", {
-			asyncId: "workflow-1",
-			asyncDir: "/tmp/workflow-1",
-			status: "running",
-			mode: "workflow",
-			startedAt: 10,
-			updatedAt: 20,
-		});
-		state.foregroundControls.set("child-1", {
-			runId: "child-1",
-			parentWorkflowRunId: "workflow-1",
-			workflowKey: "review",
-			mode: "single",
-			startedAt: 11,
-			updatedAt: 20,
-			activeChildren: new Map([[0, { index: 0, agent: "reviewer", startedAt: 11, updatedAt: 20 }]]),
-			nestedChildren: [{
-				id: "nested-review",
-				parentRunId: "child-1",
-				parentStepIndex: 0,
-				depth: 1,
-				path: [{ runId: "child-1", stepIndex: 0 }],
-				state: "complete",
-				agent: "nested-reviewer",
-				startedAt: 1_000,
-				endedAt: 4_000,
-				totalTokens: { input: 4_000, output: 200, total: 4_200 },
-			}],
-		});
-		state.foregroundControls.set("child-2", {
-			runId: "child-2",
-			parentWorkflowRunId: "workflow-1",
-			workflowKey: "test",
-			mode: "single",
-			startedAt: 12,
-			updatedAt: 20,
-			activeChildren: new Map([[0, { index: 0, agent: "tester", startedAt: 12, updatedAt: 20 }]]),
-		});
-		const fleet = new SubagentFleetStatus(state, () => {}, { refreshMs: 60_000 });
-		let widgetFactory: ((tui: unknown, theme: typeof theme) => { render(width: number): string[] }) | undefined;
-		const ctx = {
-			hasUI: true,
-			ui: {
-				setWidget(_key: string, content: typeof widgetFactory | undefined) { if (content) widgetFactory = content; },
-				onTerminalInput() { return () => {}; },
-				getEditorText() { return ""; },
-				requestRender() {},
-				notify() {},
-				theme,
-			},
-		} as unknown as ExtensionContext;
-		try {
-			fleet.setContext(ctx);
-			const tui = { requestRender() {}, focusedComponent: Object.create(Editor.prototype) as Editor };
-			const component = widgetFactory!(tui, theme);
-			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
-			let lines = component.render(180);
-			// Unselected child rows are tight: branch + single space + glyph.
-			assert.match(lines.find((line) => line.includes("○ reviewer"))!, /^ {4}├─ ○ reviewer/);
-			assert.ok(lines.some((line) => line.includes("· 4.2k tok")), "nested child row shows token spend");
-			// Selecting the first child moves the arrow into the tree, taking
-			// over the dot's cell in place — main loses the arrow, the dot
-			// column (and every sibling row) never moves.
-			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
-			assert.deepEqual(fleet.handleKey("\x1b[B"), { consume: true });
-			lines = component.render(180);
-			assert.match(lines.find((line) => line.includes("● main"))!, /^ {2}● main/);
-			assert.match(lines.find((line) => line.includes("reviewer"))!, /^ {4}├─ > reviewer/);
-			assert.match(lines.find((line) => line.includes("○ tester"))!, /^ {4}└─ ○ tester/);
+			assert.ok(lines.every((line) => !line.includes("Review only authentication") && !line.includes("Implement only billing") && !line.includes("Review the authentication changes")));
+			assert.ok(lines.some((line) => line.includes("↓ 4.2k tokens")));
 		} finally {
 			fleet.dispose();
 		}
@@ -1662,18 +1575,17 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			tui.focusedComponent = crossModuleCustomEditor as unknown as Editor;
 			assert.equal(inputHandler!("j"), undefined, "inactive FleetView should retain printable navigation keys");
 			assert.equal(inputHandler!("k"), undefined, "inactive FleetView should retain printable navigation keys");
-			// Surface tuning: the roster renders expanded by default (no compact
-			// summary line anymore).
+			assert.equal(component.render(100).length, 1, "inactive FleetView should stay compact");
 			assert.deepEqual(inputHandler!("\x1b[B"), { consume: true }, "custom editors should activate FleetView across jiti boundaries");
 			assert.ok(component.render(100).length > 1, "keyboard activation should expand the roster");
 			assert.deepEqual(inputHandler!("j"), { consume: true }, "active FleetView should navigate down with j");
-			assert.ok(component.render(100).some((line) => line.includes("> ○ worker")));
+			assert.ok(component.render(100).some((line) => line.includes("> worker")));
 			assert.deepEqual(inputHandler!("k"), { consume: true }, "active FleetView should navigate up with k");
-			assert.ok(component.render(100).some((line) => line.includes("> ● main")));
+			assert.ok(component.render(100).some((line) => line.includes("> main")));
 
 			tui.focusedComponent = Object.create(Editor.prototype) as Editor;
 			assert.deepEqual(inputHandler!("\x1b[B"), { consume: true });
-			assert.ok(component.render(100).some((line) => line.includes("> ○ worker")));
+			assert.ok(component.render(100).some((line) => line.includes("> worker")));
 			assert.deepEqual(inputHandler!("\r"), { consume: true });
 			await Promise.resolve();
 			assert.deepEqual(opened, ["foreground-active:run-worker:0"]);
@@ -1684,11 +1596,9 @@ assert.ok(lines.some((line) => line.includes("Find seams (scout)")));
 			assert.ok(widgetFactory, "closing should restore the FleetView widget");
 			assert.notEqual(widgetFactory, component, "restoration should install a new component factory");
 			const restoredComponent = widgetFactory!(tui, theme);
-			assert.ok(restoredComponent.render(100).some((line) => line.includes("> ○ worker")), "closing should restore the prior selected roster row");
+			assert.ok(restoredComponent.render(100).some((line) => line.includes("> worker")), "closing should restore the prior selected roster row");
 			assert.deepEqual(inputHandler!("\x1b"), { consume: true });
-			// Surface tuning: escape only clears selection state; the roster
-			// stays expanded (no compact summary exists anymore).
-			assert.ok(restoredComponent.render(100).length >= 1);
+			assert.equal(restoredComponent.render(100).length, 1, "Escape should return to the compact summary");
 		} finally {
 			fleet.dispose();
 		}
