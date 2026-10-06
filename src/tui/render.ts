@@ -3108,7 +3108,7 @@ export function drawNativeAsyncFrame(frame: PresentationAsyncFrame): Presentatio
 		push("async:summary", nativeSingleLine(frame, theme, width));
 		return { lines, layout };
 	}
-	if (frame.multiHeader && frame.jobs.length > 1) {
+	if (frame.multiHeader) {
 		const counts = frame.counts;
 		const hasActive = counts.running > 0 || counts.queued > 0;
 		const tone = activeHeaderTone(theme, hasActive);

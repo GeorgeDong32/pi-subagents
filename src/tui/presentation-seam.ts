@@ -362,7 +362,7 @@ interface RegisteredAdapter {
 function frameRowsOf(frame: PresentationFrame): string[] {
 	if (frame.surface === "fleet") return frame.rows.map((row) => row.rowKey);
 	const keys: string[] = [];
-	if (frame.multiHeader && frame.jobs.length > 1) keys.push("async:header");
+	if (frame.multiHeader) keys.push("async:header");
 	for (const job of frame.jobs) {
 		keys.push(job.rowKey);
 		for (const row of job.rows) keys.push(`${job.rowKey}:${row.rowKey}`);

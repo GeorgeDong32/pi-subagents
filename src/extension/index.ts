@@ -399,6 +399,13 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			...(fleetViewEnabled ? { fleet: drawNativeFleetFrame } : {}),
 			async: drawNativeAsyncFrame,
 		},
+		// Adapter swaps must invalidate cached widget lines immediately —
+		// otherwise the next animation frame would keep the previous adapter's
+		// bytes (async cachedLines) or the prepaint cache (fleet).
+		onAdapterChange: (surface) => {
+			if (surface === "async") asyncJobTrackerApi.rerenderAsyncWidget();
+			else fleetStatus?.refresh();
+		},
 	});
 	const fleetStatus = fleetViewEnabled
 		? new SubagentFleetStatus(state, async (itemKey) => {
@@ -493,7 +500,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			agents: merged.agents.map((agent) => agent.maxThinking === discovered.maxThinking ? agent : { ...agent, maxThinking: discovered.maxThinking }),
 		};
 	};
-	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs, dispose: disposeAsyncJobTracker } = createAsyncJobTracker(pi, state, DIRS.async, {
+	const asyncJobTrackerApi = createAsyncJobTracker(pi, state, DIRS.async, {
 		widgetEnabled: asyncWidgetEnabled,
 		widgetCollapsed: asyncWidgetCollapsed,
 		onJobTerminal: () => refreshResultDelivery(),
@@ -503,6 +510,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		// host below exists). Absent/unregistered = native composition.
 		seamDraw: (frame) => presentationHost.draw("async", frame).result,
 	});
+	const { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs, dispose: disposeAsyncJobTracker } = asyncJobTrackerApi;
 	const resultWatcher = createResultWatcher(
 		pi,
 		state,

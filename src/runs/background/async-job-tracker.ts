@@ -79,7 +79,7 @@ const dispatchLabels = new Map<string, string>();
 export function rememberDispatchLabel(runId: string, label: string): void {
 	if (runId && label) dispatchLabels.set(runId, label.trim());
 }
-export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: SubagentState, asyncDirRoot: string, options: AsyncJobTrackerOptions = {}): {
+export interface AsyncJobTracker {
 	ensurePoller: () => void;
 	refreshWidget: (ctx: ExtensionContext) => void;
 	handleStarted: (data: unknown) => void;
@@ -87,7 +87,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	resetJobs: (ctx?: ExtensionContext) => void;
 	restoreActiveJobs: (ctx?: ExtensionContext) => void;
 	dispose: () => void;
-} {
+	/** Invalidate the mounted async widget (presentation-seam adapter changes). */
+	rerenderAsyncWidget: () => void;
+}
+
+export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: SubagentState, asyncDirRoot: string, options: AsyncJobTrackerOptions = {}): AsyncJobTracker {
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
 	const livenessIntervalMs = options.pollIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS;
 	const resultsDir = options.resultsDir ?? DIRS.results;
@@ -873,5 +877,10 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		rerenderLastWidget();
 	};
 
-	return { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs, dispose };
+	return { ensurePoller, refreshWidget, handleStarted, handleComplete, resetJobs, restoreActiveJobs, dispose,
+		/** Invalidate the mounted async widget (presentation-seam adapter changes). */
+		rerenderAsyncWidget: () => {
+			if (options.widgetEnabled === false) return;
+			rerenderLastWidget();
+		} };
 }
