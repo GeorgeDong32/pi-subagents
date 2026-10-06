@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { renderWidget, widgetRenderKey } from "../../tui/render.ts";
+import { renderWidget, widgetRenderKey, type AsyncSeamDraw } from "../../tui/render.ts";
 import { formatControlNoticeMessage } from "../shared/subagent-control.ts";
 import {
 	type AsyncJobState,
@@ -36,6 +36,8 @@ interface AsyncJobTrackerOptions {
 	resultsDir?: string;
 	widgetEnabled?: boolean;
 	widgetCollapsed?: boolean;
+	/** Presentation seam dispatcher (spec §5); absent = native composition. */
+	seamDraw?: AsyncSeamDraw;
 	platform?: NodeJS.Platform;
 	onJobTerminal?: () => void;
 	watch?: typeof fs.watch;
@@ -112,7 +114,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
 		if (state.widgetsSuspended) return;
-		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed);
+		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed, options.seamDraw);
 		(ctx.ui as { requestRender?: () => void }).requestRender?.();
 	};
 	const rerenderLastWidget = (jobs = Array.from(state.asyncJobs.values())) => {
@@ -132,7 +134,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (state.widgetsSuspended) return;
 			const requestRender = (ctx.ui as { requestRender?: () => void }).requestRender;
 			if (requestRender) requestRender.call(ctx.ui);
-			else renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed);
+			else renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed, options.seamDraw);
 		});
 	};
 	const refreshWidget = (ctx: ExtensionContext) => rerenderWidget(ctx);

@@ -36,7 +36,7 @@ interface WidgetHarness {
 const originalRows = process.stdout.rows;
 const originalColumns = process.stdout.columns;
 
-function mount(jobs: AsyncJobState[], options: { collapsed?: boolean; expanded?: boolean; rows?: number; columns?: number } = {}): WidgetHarness {
+function mount(jobs: AsyncJobState[], options: { collapsed?: boolean; expanded?: boolean; rows?: number; columns?: number; seamDraw?: (frame: never) => { lines: string[]; layout: Array<{ rowKey: string; fromLine: number; toLine: number; truncated: boolean }> } } = {}): WidgetHarness {
 	// Headless runs have no TTY: pin the terminal geometry so the adaptive
 	// fit picks a deterministic tier, and reset the module-level layout
 	// session so cases don't inherit each other's tier.
@@ -53,7 +53,7 @@ function mount(jobs: AsyncJobState[], options: { collapsed?: boolean; expanded?:
 			getToolsExpanded: () => options.expanded === true,
 		},
 	} as unknown as ExtensionContext;
-	renderWidget(ctx, jobs, options.collapsed === true);
+	renderWidget(ctx, jobs, options.collapsed === true, options.seamDraw as never);
 	const factory = widgetFactory as (tui: unknown, theme: unknown) => WidgetHarness;
 	const component = factory({ requestRender() {} }, theme as never);
 	return {
@@ -206,6 +206,29 @@ describe("async widget characterization", () => {
 		}
 	});
 
+
+	it("tight terminal engages the progressive tier: header + one visible job + hidden counts", () => {
+		const originalNow = Date.now;
+		Date.now = () => NOW;
+		try {
+			const component = mount([
+				job({ asyncId: "a", description: "a work" }),
+				job({ asyncId: "b", description: "b work" }),
+				job({ asyncId: "c", description: "c work" }),
+				job({ asyncId: "d", description: "d work" }),
+			], { rows: 22 });
+			const lines = component.render(80).map((line) => line.trim());
+			assert.deepEqual(lines, [
+				"⠋ Async agents · 4 agents running",
+				"⠋ single · running · 15.0s · thinking…",
+				"+3 more (3 running)",
+			], `actual: ${JSON.stringify(lines)}`);
+		} finally {
+			Date.now = originalNow;
+			restoreTerminal();
+		}
+	});
+
 	it("renderWidget clears the widget when jobs is empty", () => {
 		const cleared: Array<[string, unknown]> = [];
 		const ctx = {
@@ -249,3 +272,65 @@ describe("async widget characterization", () => {
 
 void (undefined as unknown as SubagentState);
 void FRAME;
+
+// ---- Seam contract (spec §5): adapter injection over the async surface ----
+
+describe("async widget through the presentation seam", () => {
+	it("a registered adapter's lines replace the native composition (seamDraw path)", () => {
+		const originalNow = Date.now;
+		Date.now = () => NOW;
+		try {
+			const seen: string[] = [];
+			const component = mount(
+				[job({ asyncId: "solo", description: "检查展示接口", currentTool: "Read" })],
+				{
+					expanded: false,
+					seamDraw: (frame) => {
+						seen.push(frame.tier);
+						return {
+							lines: frame.jobs.map((section) => `CC:${section.header.state}`),
+							layout: [{ rowKey: frame.jobs[0]!.rowKey, fromLine: 0, toLine: 0, truncated: false }],
+						};
+					},
+				},
+			);
+			const lines = component.render(80).map((line) => line.trim());
+			assert.deepEqual(lines, ["CC:running"], "adapter lines replace native (owner pads to width)");
+			assert.deepEqual(seen, ["full"]);
+		} finally {
+			Date.now = originalNow;
+			restoreTerminal();
+		}
+	});
+
+	it("native round-trip parity: projection → drawNativeAsyncFrame equals the pinned bytes", async () => {
+		const { projectAsyncWidgetFrame, drawNativeAsyncFrame } = await import("../../src/tui/render.ts");
+		const originalNow = Date.now;
+		Date.now = () => NOW;
+		try {
+			const component = mount([
+				job({ asyncId: "r1", description: "alpha" }),
+				job({ asyncId: "q1", status: "queued", description: "beta" }),
+				job({ asyncId: "f1", status: "complete", description: "done work" }),
+			]);
+			const pinned = component.render(100).map((line) => line.trim());
+			// Same scenario through an explicit frame round-trip must match.
+			const frame = projectAsyncWidgetFrame({
+				roots: [job({ asyncId: "r1", description: "alpha" }), job({ asyncId: "q1", status: "queued", description: "beta" }), job({ asyncId: "f1", status: "complete", description: "done work" })] as never,
+				jobs: [job({ asyncId: "r1", description: "alpha" }), job({ asyncId: "q1", status: "queued", description: "beta" }), job({ asyncId: "f1", status: "complete", description: "done work" })] as never,
+				theme: theme as never,
+				width: 98,
+				expanded: false,
+				projectionFor: (j) => (j as never), // not used by multi-item heads
+				tier: "full",
+			});
+			const drawn = drawNativeAsyncFrame(frame);
+			for (const line of pinned.slice(1)) {
+				assert.ok(drawn.lines.some((candidate) => candidate.trim() === line), `missing parity line: ${line}`);
+			}
+		} finally {
+			Date.now = originalNow;
+			restoreTerminal();
+		}
+	});
+});

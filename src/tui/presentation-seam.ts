@@ -219,11 +219,24 @@ export interface PresentationAsyncJobSection {
 		context?: string;
 		stats?: string;
 		activity?: string;
-		/** Pre-composed status glyph string (theme-applied at projection time is NOT allowed — pass inputs instead). */
 		glyphState: "running" | "queued" | "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 		compactWorkflow: boolean;
 		singleChildJob: boolean;
+		/** Theme-applied glyph string (animation frame captured at projection). */
+		glyph?: string;
+		/** Theme-applied context badge (native formula output). */
+		contextBadge?: string;
+		/** Workflow child identity (workflowKey ?? asyncId) for tree lines. */
+		identity?: string;
+		/** Pre-composed single-line summary (progressive tier; width-exact). */
+		summaryLine?: string;
+		/** Pre-composed single-job title line (width-exact native material). */
+		titleLine?: string;
+		/** Pre-composed multi-item head line (width-exact native material). */
+		itemHeadLine?: string;
 	};
+	/** Materialized workflow-children lines, byte-exact (v1 text material). */
+	childrenLines?: string[];
 	rows: Array<PresentationAsyncDetailRow | PresentationWorkflowLaneRow | PresentationWorkflowPhaseRow | PresentationNestedRow>;
 	children: PresentationAsyncJobSection[];
 	childrenHidden?: number;
@@ -232,12 +245,14 @@ export interface PresentationAsyncJobSection {
 export interface PresentationAsyncFrame extends PresentationFrameBase {
 	surface: "async";
 	/** Owner-side adaptive tier decision; adapters draw per tier. */
-	tier: "single-line" | "full";
+	tier: "single-line" | "full" | "progressive";
 	counts: PresentationAsyncCounts;
-	/** Multi-job header material ("Async agents · background"). */
-	multiHeader?: { active: boolean; anyRunning: boolean };
+	/** Multi-job header material ("Async agents · background" / progressive header). */
+	multiHeader?: { active: boolean; anyRunning: boolean; glyph?: string; label?: string };
 	jobs: PresentationAsyncJobSection[];
-	hidden?: { running: number; finished: number };
+	hidden?: { running: number; finished: number; queued?: number };
+	/** Progressive tier: the composed hidden-counts line (width-exact). */
+	hiddenLine?: string;
 }
 
 export type PresentationFrame = PresentationFleetFrame | PresentationAsyncFrame;
@@ -341,18 +356,28 @@ interface RegisteredAdapter {
 	disposed: boolean;
 }
 
-/** Logical row keys of a frame, per surface shape (fleet: flat rows; async: job sections). */
+/** Logical row keys of a frame, per surface shape (fleet: flat rows; async: job
+ * sections — headers, detail rows, children lines, and overflow markers all
+ * count, matching what a conforming adapter's layout must cover). */
 function frameRowsOf(frame: PresentationFrame): string[] {
 	if (frame.surface === "fleet") return frame.rows.map((row) => row.rowKey);
 	const keys: string[] = [];
+	if (frame.multiHeader && frame.jobs.length > 1) keys.push("async:header");
 	for (const job of frame.jobs) {
 		keys.push(job.rowKey);
-		for (const row of job.rows) keys.push(row.rowKey);
+		for (const row of job.rows) keys.push(`${job.rowKey}:${row.rowKey}`);
+		if (job.header.titleLine !== undefined && job.header.summaryLine !== undefined) keys.push(`${job.rowKey}:summary`);
+		for (const [index] of (job.childrenLines ?? []).entries()) keys.push(`${job.rowKey}:child:${index}`);
 		for (const child of job.children) {
 			keys.push(child.rowKey);
-			for (const row of child.rows) keys.push(row.rowKey);
+			for (const row of child.rows) keys.push(`${child.rowKey}:${row.rowKey}`);
+			for (const [index] of (child.childrenLines ?? []).entries()) keys.push(`${child.rowKey}:child:${index}`);
 		}
 		if (job.childrenHidden !== undefined && job.childrenHidden > 0) keys.push(`${job.rowKey}:children-hidden`);
+	}
+	if (frame.hidden) {
+		const total = frame.hidden.running + frame.hidden.finished + (frame.hidden.queued ?? 0);
+		if (total > 0) keys.push("async:hidden");
 	}
 	return keys;
 }

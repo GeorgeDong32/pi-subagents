@@ -33,6 +33,7 @@ import { flatToLogicalStepIndex } from "../runs/background/parallel-groups.ts";
 import { formatNestedAggregate } from "../runs/shared/nested-render.ts";
 import { aggregateStepStatus, formatActivityLabel, formatAgentRunningLabel, formatParallelOutcome } from "../shared/status-format.ts";
 import { contextModeBadge, contextModePrefix } from "../runs/shared/context-mode.ts";
+import type { PresentationAsyncCounts, PresentationAsyncDetailRow, PresentationAsyncFrame, PresentationAsyncJobSection, PresentationDrawResult } from "./presentation-seam.ts";
 import { shouldSuppressSingleStep, stripRepeatedAgentPrefix, withDuplicateLabelDiscriminators } from "./render-helpers.ts";
 import { runningTone } from "./running-tone.ts";
 import { childThinkingLevel, type ThinkingLevel } from "../shared/model-info.ts";
@@ -2762,10 +2763,11 @@ function fitWidgetLineBudget(lines: string[], theme: Theme, width: number, expan
 	return [...lines.slice(0, visibleLines), truncLine(theme.fg("dim", hint), width)];
 }
 
-function fitAdaptiveWidgetLines(jobs: AsyncJobState[], buildLines: () => string[], theme: Theme, width: number, expanded: boolean, frame?: number, projectionFor?: WorkflowWidgetProjectionLookup): string[] {
+function fitAdaptiveWidgetLines(jobs: AsyncJobState[], buildLines: () => string[], theme: Theme, width: number, expanded: boolean, frame?: number, projectionFor?: WorkflowWidgetProjectionLookup, seamCompose?: (tier: "single-line" | "full") => string[]): string[] {
+	const composeFull = (): string[] => (seamCompose ? seamCompose("full") : buildLines());
 	if (expanded) {
 		resetWidgetLayoutSession();
-		return fitWidgetLineBudget(buildLines(), theme, width, true);
+		return fitWidgetLineBudget(composeFull(), theme, width, true);
 	}
 
 	const hasMatchingSession = widgetSessionMatches(expanded);
@@ -2774,7 +2776,7 @@ function fitAdaptiveWidgetLines(jobs: AsyncJobState[], buildLines: () => string[
 	const availableRows = estimateAvailableWidgetRows();
 
 	if (hasMatchingSession && widgetLayoutSession?.tier === "single-line") {
-		return buildSingleLineWidgetLines(jobs, theme, width, frame);
+		return seamCompose ? seamCompose("single-line") : buildSingleLineWidgetLines(jobs, theme, width, frame);
 	}
 
 	if (hasMatchingSession && widgetLayoutSession?.tier === "progressive" && widgetLayoutSession.lockedRows !== undefined) {
@@ -2795,7 +2797,7 @@ function fitAdaptiveWidgetLines(jobs: AsyncJobState[], buildLines: () => string[
 		return rendered.lines.slice(0, session.lockedRows);
 	}
 
-	const lines = buildLines();
+	const lines = composeFull();
 	if (lines.length <= availableRows) {
 		widgetLayoutSession = { expanded, rows, columns, tier: "full", visibleJobKeys: [] };
 		return fitWidgetLineBudget(lines, theme, width, false);
@@ -2906,7 +2908,243 @@ function materializedWidgetChildLines(job: AsyncJobState, theme: Theme, width: n
 	return lines;
 }
 
-function buildWidgetComponent(jobs: AsyncJobState[], ui: ExtensionContext["ui"], initiallyCollapsed = false): (tui: { requestRender(): void }, theme: Theme) => Component {
+// ---- Async presentation seam (spec §5/§4.4): projection + native adapter ----
+//
+// The owner keeps the adaptive tier decision, visible-job selection, coverage
+// and the height-lock bookkeeping. projectAsyncWidgetFrame materializes what
+// the current tier shows — structured header inputs plus §5.2 text material
+// (composed lines are theme-applied at projection time; the frame carries the
+// current theme) — and drawNativeAsyncFrame re-assembles the pre-seam bytes
+// from that material. async-widget-characterization.test.ts pins the parity.
+// The progressive tier (tight-terminal adaptive card) stays native-composed
+// in v1: its row-budget interleaving is owner layout, not adapter drawing.
+
+interface AsyncFrameProjectInput {
+	roots: AsyncJobState[];
+	jobs: AsyncJobState[];
+	theme: Theme;
+	width: number;
+	expanded: boolean;
+	frame?: number;
+	projectionFor: WorkflowWidgetProjectionLookup;
+}
+
+function asyncCountsOf(jobs: AsyncJobState[]): PresentationAsyncCounts {
+	const counts = widgetHeaderCounts(jobs);
+	return {
+		running: counts.running.length,
+		queued: counts.queued.length,
+		failed: counts.failed.length,
+		stopped: counts.stopped.length,
+		paused: counts.paused.length,
+		partial: jobs.filter((job) => job.status === "partial").length,
+		rejected: jobs.filter((job) => job.status === "rejected").length,
+		complete: counts.complete.length,
+		total: jobs.length,
+	};
+}
+
+function asyncDetailRows(lines: string[], firstGutter: boolean): PresentationAsyncDetailRow[] {
+	return lines.map((text, index) => ({ rowKind: "detail" as const, rowKey: `detail:${index}`, text, gutter: firstGutter && index === 0, tone: "plain" as const }));
+}
+
+function asyncJobSection(job: AsyncJobState, rowKey: string, input: AsyncFrameProjectInput): PresentationAsyncJobSection {
+	const projection = input.projectionFor(job);
+	const compactWorkflow = ((!input.expanded || projection.inlineFleetCovered === true) && job.mode === "workflow") as boolean;
+	const stats = widgetStats(job, input.theme, projection, !input.expanded);
+	const rows: PresentationAsyncJobSection["rows"] = compactWorkflow
+		? asyncDetailRows(compactWorkflowWidgetBodyLines(job, input.theme, input.frame, projection), false)
+		: input.roots.length === 1 && !projection.children?.length
+			? asyncDetailRows(foregroundStyleWidgetDetails(job, input.theme, input.expanded, input.width, input.frame, projection), true)
+			: asyncDetailRows([
+				`  ${input.theme.fg("dim", `⎿  ${widgetActivity(job)}`)}`,
+				...widgetLaneDetailLines(job, input.theme, projection),
+				...workflowChecklistWidgetLines(widgetChecklistWithoutMaterializedChildren(projection), input.theme, "  ", input.expanded, input.frame, { includeItemErrors: !input.expanded || !job.steps?.length }),
+				...widgetParallelAgentDetails(job, input.theme, input.expanded, input.width, input.frame),
+			], true);
+	const childrenLines = materializedWidgetChildLines(job, input.theme, input.width, input.expanded, input.frame, input.projectionFor);
+	return {
+		rowKey,
+		header: {
+			name: widgetJobName(job),
+			title: "",
+			state: job.status,
+			...(job.context !== undefined ? { context: job.context } : {}),
+			...(stats ? { stats } : {}),
+			activity: widgetActivity(job),
+			glyphState: job.status,
+			compactWorkflow,
+			singleChildJob: isSingleChildAsyncJob(job) === true,
+			glyph: widgetStatusGlyph(job, input.theme, input.frame),
+			contextBadge: contextModeBadge(input.theme, job.context),
+			identity: job.workflowKey ?? job.asyncId,
+			...(compactWorkflow ? { itemHeadLine: compactWorkflowHeaderLine(job, input.theme, input.width) } : {}),
+		},
+		rows,
+		children: [],
+		...(childrenLines.length ? { childrenLines: childrenLines.map((line) => truncLine(line, input.width)) } : {}),
+	};
+}
+
+/** Project the async widget's current tier into a read-only frame. */
+export function projectAsyncWidgetFrame(input: AsyncFrameProjectInput & { tier: PresentationAsyncFrame["tier"]; visibleRoots?: AsyncJobState[]; hidden?: PresentationAsyncFrame["hidden"] }): PresentationAsyncFrame {
+	const base = {
+		protocol: 1 as const,
+		surface: "async" as const,
+		revision: JSON.stringify([input.jobs.map((job) => [job.asyncId, job.status, job.updatedAt]), input.expanded]),
+		session: null,
+		runtimeGeneration: 0,
+		width: input.width,
+		theme: input.theme as unknown as PresentationAsyncFrame["theme"],
+		now: Date.now(),
+		counts: asyncCountsOf(input.jobs),
+	};
+	if (input.tier === "single-line") {
+		const counts = widgetHeaderCounts(input.jobs);
+		const hasActive = counts.running.length > 0 || counts.queued.length > 0;
+		const glyph = counts.running.length > 0 ? runningGlyph(animatedSeed(widgetJobsRunningSeed(counts.running), input.frame)) : hasActive ? "●" : "○";
+		return { ...base, tier: "single-line", jobs: [], ...(hasActive ? { multiHeader: { active: true, anyRunning: counts.running.length > 0, glyph } } : {}) };
+	}
+	let visible = input.visibleRoots ?? input.roots;
+	let multiHeader: PresentationAsyncFrame["multiHeader"];
+	if (visible.length > 1 || (input.roots.length > 1 && visible.length >= 1)) {
+		const counts = widgetHeaderCounts(input.jobs);
+		const hasActive = counts.running.length > 0 || counts.queued.length > 0;
+		const glyph = counts.running.length > 0 ? runningGlyph(animatedSeed(widgetJobsRunningSeed(counts.running), input.frame)) : hasActive ? "●" : "○";
+		multiHeader = { active: true, anyRunning: counts.running.length > 0, glyph };
+	}
+	let hidden: PresentationAsyncFrame["hidden"];
+	let queuedSummary = false;
+	if (input.visibleRoots === undefined && input.roots.length > 1) {
+		const selection = selectWidgetJobs(input.roots);
+		visible = selection.visible;
+		queuedSummary = selection.queuedSummary;
+		hidden = selection.hidden;
+	}
+	const jobs: PresentationAsyncJobSection[] = [];
+	if (queuedSummary) {
+		const queuedCount = widgetHeaderCounts(input.jobs).queued.length;
+		jobs.push({
+			rowKey: "async:queued-summary",
+			header: {
+				name: `${queuedCount} queued`,
+				title: "",
+				state: "queued",
+				glyphState: "queued",
+				compactWorkflow: false,
+				singleChildJob: false,
+				itemHeadLine: `${input.theme.fg("muted", "◦")} ${input.theme.fg("dim", `${queuedCount} queued`)}`,
+			},
+			rows: [],
+			children: [],
+		});
+	}
+	if (visible.length === 1 && input.roots.length === 1 && !input.projectionFor(visible[0]!).children?.length) {
+		// Single-job layout: composed title + summary lines, then the detail rows.
+		const job = visible[0]!;
+		const projection = input.projectionFor(job);
+		const section = asyncJobSection(job, `async:${job.asyncId}`, input);
+		section.header.titleLine = `${input.theme.fg("toolTitle", themeBold(input.theme, singleWidgetTitle(job, projection)))} ${input.theme.fg("dim", "· background")}`;
+		const stats = widgetStats(job, input.theme, projection, !input.expanded);
+		section.header.summaryLine = `${widgetStatusGlyph(job, input.theme, input.frame)} ${themeBold(input.theme, widgetJobName(job))}${contextModeBadge(input.theme, job.context)}${stats ? ` ${input.theme.fg("dim", "·")} ${stats}` : ""}`;
+		jobs.push(section);
+	} else {
+		for (const job of visible) {
+			const section = asyncJobSection(job, `async:${job.asyncId}`, input);
+			const stats = widgetStats(job, input.theme, input.projectionFor(job), !input.expanded);
+			if (!section.header.compactWorkflow) {
+				section.header.itemHeadLine = `${widgetStatusGlyph(job, input.theme, input.frame)} ${themeBold(input.theme, widgetJobName(job))}${contextModeBadge(input.theme, job.context)}${stats ? ` ${input.theme.fg("dim", "·")} ${stats}` : ""}`;
+			}
+			jobs.push(section);
+		}
+	}
+	return {
+		...base,
+		tier: "full",
+		...(multiHeader ? { multiHeader } : {}),
+		jobs,
+		...(hidden ?? input.hidden ?? {}),
+	};
+}
+
+/** The single-job widget title, extracted verbatim from buildSingleWidgetLines. */
+function singleWidgetTitle(job: AsyncJobState, projection: WorkflowWidgetProjection): string {
+	const count = job.mode === "workflow"
+		? projection.checklist?.total ?? projection.stageProgress?.total ?? job.stepsTotal ?? job.agents?.length ?? job.steps?.length
+		: job.mode === "chain" ? job.chainStepCount : projection.stageProgress?.total ?? job.stepsTotal ?? job.agents?.length ?? job.steps?.length;
+	const mode = widgetJobName(job);
+	return isSingleChildAsyncJob(job)
+		? "async subagent"
+		: `async subagent ${mode}${count && count > 1 ? ` (${count})` : ""}`;
+}
+
+function nativeSingleLine(frame: PresentationAsyncFrame, theme: Theme, width: number): string {
+	const counts = frame.counts;
+	const hasActive = counts.running > 0 || counts.queued > 0;
+	const parts: string[] = [];
+	if (counts.running > 0) parts.push(`${counts.running}/${counts.total} running`);
+	if (counts.queued > 0) parts.push(`${counts.queued} queued`);
+	if (counts.failed > 0) parts.push(`${counts.failed} failed`);
+	if (counts.stopped > 0) parts.push(`${counts.stopped} stopped`);
+	if (counts.paused > 0) parts.push(`${counts.paused} paused`);
+	if (counts.partial > 0) parts.push(`${counts.partial} partial`);
+	if (counts.rejected > 0) parts.push(`${counts.rejected} rejected`);
+	if (!hasActive && counts.complete > 0) parts.push(`${counts.complete}/${counts.total} done`);
+	const tone = activeHeaderTone(theme, hasActive);
+	return truncLine(`${tone(frame.multiHeader?.glyph ?? "○")} ${tone("subagents")} (${parts.join(", ") || `${counts.total} total`})`, width);
+}
+
+/** The native async adapter: re-assembles the pre-seam composition from a projected frame. */
+export function drawNativeAsyncFrame(frame: PresentationAsyncFrame): PresentationDrawResult {
+	const theme = frame.theme as unknown as Theme;
+	const width = frame.width;
+	const lines: string[] = [];
+	const layout: PresentationDrawResult["layout"] = [];
+	const push = (rowKey: string, line: string): void => {
+		layout.push({ rowKey, fromLine: lines.length, toLine: lines.length, truncated: false });
+		lines.push(line);
+	};
+	if (frame.tier === "single-line") {
+		push("async:summary", nativeSingleLine(frame, theme, width));
+		return { lines, layout };
+	}
+	if (frame.multiHeader && frame.jobs.length > 1) {
+		const counts = frame.counts;
+		const hasActive = counts.running > 0 || counts.queued > 0;
+		const tone = activeHeaderTone(theme, hasActive);
+		push("async:header", truncLine(`${tone(frame.multiHeader.glyph ?? (hasActive ? "●" : "○"))} ${tone("Async agents")} ${theme.fg("dim", "· background")}`, width));
+	}
+	for (const [index, section] of frame.jobs.entries()) {
+		const head = section.header;
+		if (head.titleLine !== undefined) {
+			// Single-job layout: title + summary + rows, no connectors.
+			push(section.rowKey, truncLine(head.titleLine, width));
+			if (head.summaryLine !== undefined) push(`${section.rowKey}:summary`, truncLine(head.summaryLine, width));
+			for (const row of section.rows) if (row.rowKind === "detail") push(`${section.rowKey}:${row.rowKey}`, truncLine(row.text, width));
+			for (const [childIndex, childLine] of (section.childrenLines ?? []).entries()) push(`${section.rowKey}:child:${childIndex}`, truncLine(childLine, width));
+			continue;
+		}
+		const last = index === frame.jobs.length - 1 && !frame.hidden;
+		const branch = last ? "└─" : "├─";
+		const continuation = last ? "   " : "│  ";
+		push(section.rowKey, truncLine(`${theme.fg("dim", branch)} ${head.itemHeadLine ?? ""}`, width));
+		for (const row of section.rows) if (row.rowKind === "detail") push(`${section.rowKey}:${row.rowKey}`, truncLine(`${theme.fg("dim", continuation)} ${row.text}`, width));
+		for (const [childIndex, childLine] of (section.childrenLines ?? []).entries()) push(`${section.rowKey}:child:${childIndex}`, truncLine(`${theme.fg("dim", continuation)} ${childLine}`, width));
+	}
+	if (frame.hidden) {
+		const total = frame.hidden.running + frame.hidden.finished + (frame.hidden.queued ?? 0);
+		const parts: string[] = [];
+		if (frame.hidden.running > 0) parts.push(`${frame.hidden.running} running`);
+		if ((frame.hidden.queued ?? 0) > 0) parts.push(`${frame.hidden.queued} queued`);
+		if (frame.hidden.finished > 0) parts.push(`${frame.hidden.finished} finished`);
+		if (total > 0) push("async:hidden", truncLine(theme.fg("dim", `+${total} more (${parts.join(", ")})`), width));
+	}
+	return { lines, layout };
+}
+
+export type AsyncSeamDraw = (frame: PresentationAsyncFrame) => PresentationDrawResult;
+
+function buildWidgetComponent(jobs: AsyncJobState[], ui: ExtensionContext["ui"], initiallyCollapsed = false, seamDraw?: AsyncSeamDraw): (tui: { requestRender(): void }, theme: Theme) => Component {
 	return (tui, theme) => {
 		const container = new Container();
 		let cachedRenderWidth: number | undefined;
@@ -2979,17 +3217,63 @@ function buildWidgetComponent(jobs: AsyncJobState[], ui: ExtensionContext["ui"],
 				: roots.length === 1 && !projectionFor(roots[0]!).children?.length
 					? compactSingleWidgetLines(roots[0]!, theme, width, frame, projectionFor(roots[0]!))
 					: buildWidgetLinesWithProjection(roots, theme, width, false, frame, projectionFor);
+			// Presentation seam (spec §5): project the current tier and draw through
+			// the registered adapter; the native adapter is the default and the
+			// fallback. The progressive tier stays native-composed in v1.
+			const seamCompose = (tier: "single-line" | "full"): string[] => {
+				const composed = projectAsyncWidgetFrame({ roots, jobs, theme, width, expanded, frame, projectionFor, tier });
+				return (seamDraw ? seamDraw(composed) : drawNativeAsyncFrame(composed)).lines;
+			};
 			cachedRenderWidth = renderWidth;
 			cachedFrame = frame;
 			cachedExpanded = expanded;
 			cachedLines = (collapsed
-				? buildSingleLineWidgetLines(jobs, theme, width, frame)
-				: fitAdaptiveWidgetLines(roots, buildLines, theme, width, expanded, frame, projectionFor)
+				? seamCompose("single-line")
+				: fitAdaptiveWidgetLines(roots, buildLines, theme, width, expanded, frame, projectionFor, seamCompose)
 			).map((line) => paddedWidgetLine(line, renderWidth));
 			return cachedLines;
 		};
 		return component;
 	};
+}
+
+/** Owner-side visible-job selection for the multi-job widget (seam-shared):
+ * running first, then the queued summary line, then finished, bounded by
+ * MAX_WIDGET_JOBS; hidden counts for the overflow line. */
+function selectWidgetJobs(jobs: AsyncJobState[]): {
+	visible: AsyncJobState[];
+	queuedSummary: boolean;
+	hidden: { running: number; finished: number; queued: number };
+} {
+	const running = jobs.filter((job) => job.status === "running");
+	const queued = jobs.filter((job) => job.status === "queued");
+	const finished = jobs.filter((job) => job.status !== "running" && job.status !== "queued");
+	const visible: AsyncJobState[] = [];
+	let hiddenRunning = 0;
+	let hiddenFinished = 0;
+	let slots = MAX_WIDGET_JOBS;
+	for (const job of running) {
+		if (slots <= 0) {
+			hiddenRunning++;
+			continue;
+		}
+		visible.push(job);
+		slots--;
+	}
+	let queuedSummary = false;
+	if (queued.length > 0 && slots > 0) {
+		queuedSummary = true;
+		slots--;
+	}
+	for (const job of finished) {
+		if (slots <= 0) {
+			hiddenFinished++;
+			continue;
+		}
+		visible.push(job);
+		slots--;
+	}
+	return { visible, queuedSummary, hidden: { running: hiddenRunning, finished: hiddenFinished, queued: queued.length > 0 && !queuedSummary ? queued.length : 0 } };
 }
 
 function buildWidgetLinesWithProjection(jobs: AsyncJobState[], theme: Theme, width = getTermWidth(), expanded = false, frame?: number, projectionFor: WorkflowWidgetProjectionLookup = workflowWidgetProjectionLookup()): string[] {
@@ -3086,7 +3370,7 @@ export function buildWidgetLines(jobs: AsyncJobState[], theme: Theme, width = ge
 /**
  * Render the async jobs widget
  */
-export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[], initiallyCollapsed = false): void {
+export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[], initiallyCollapsed = false, seamDraw?: AsyncSeamDraw): void {
 	if (jobs.length === 0) {
 		resetWidgetLayoutSession();
 		asyncWidgetUpdates.delete(ctx.ui);
@@ -3102,7 +3386,7 @@ export function renderWidget(ctx: ExtensionContext, jobs: AsyncJobState[], initi
 	// component instead so progress cannot move it past other extensions' widgets.
 	const update = asyncWidgetUpdates.get(ctx.ui);
 	if (update) update(jobs);
-	else ctx.ui.setWidget(WIDGET_KEY, buildWidgetComponent(jobs, ctx.ui, initiallyCollapsed));
+	else ctx.ui.setWidget(WIDGET_KEY, buildWidgetComponent(jobs, ctx.ui, initiallyCollapsed, seamDraw));
 }
 
 function renderSingleCompact(

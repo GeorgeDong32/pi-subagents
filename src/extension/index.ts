@@ -31,7 +31,7 @@ import { getAgentDir } from "../shared/utils.ts";
 import { isStaleExtensionContextError, MODEL_ONLY_TOOL, withCachedUiContext } from "../shared/extension-context.ts";
 import { currentCompletionOwnerId } from "../shared/completion-owner.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
-import { clearLegacyResultAnimationTimer, renderSubagentResult, renderSubagentSummary, setInlineWorkflowCoverage } from "../tui/render.ts";
+import { clearLegacyResultAnimationTimer, drawNativeAsyncFrame, renderSubagentResult, renderSubagentSummary, setInlineWorkflowCoverage } from "../tui/render.ts";
 import { getInspectorPlugins, registerInspectorEventListener } from "../inspectors/plugins.ts";
 import { SubagentFleetStatus, drawNativeFleetFrame, resolveFleetViewPlacement } from "../tui/fleet-status.ts";
 import { PresentationSeamHost } from "../tui/presentation-seam.ts";
@@ -395,7 +395,10 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	const presentationHost = new PresentationSeamHost({
 		events: pi.events,
 		session: () => state.currentSessionId,
-		native: fleetViewEnabled ? { fleet: drawNativeFleetFrame } : {},
+		native: {
+			...(fleetViewEnabled ? { fleet: drawNativeFleetFrame } : {}),
+			async: drawNativeAsyncFrame,
+		},
 	});
 	const fleetStatus = fleetViewEnabled
 		? new SubagentFleetStatus(state, async (itemKey) => {
@@ -495,6 +498,10 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		widgetCollapsed: asyncWidgetCollapsed,
 		onJobTerminal: () => refreshResultDelivery(),
 		supervisorRequestState: supervisorChannel.getSupervisorRequestState,
+		// Presentation seam: the async widget draws through the registered
+		// adapter when one is active (closure runs at render time, after the
+		// host below exists). Absent/unregistered = native composition.
+		seamDraw: (frame) => presentationHost.draw("async", frame).result,
 	});
 	const resultWatcher = createResultWatcher(
 		pi,
