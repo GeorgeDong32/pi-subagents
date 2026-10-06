@@ -184,7 +184,63 @@ export interface PresentationFleetFrame extends PresentationFrameBase {
 	summary: PresentationFleetSummary;
 }
 
-export type PresentationFrame = PresentationFleetFrame;
+// ---- Async surface (spec §4.4): the subagent-async widget as a frame ----
+
+/** Collapsed single-line summary counts (native tier material). */
+export interface PresentationAsyncCounts {
+	running: number;
+	queued: number;
+	failed: number;
+	stopped: number;
+	paused: number;
+	partial: number;
+	rejected: number;
+	complete: number;
+	total: number;
+}
+
+/** A display-projected activity/status text line (spec §5.2 文本材料). */
+export interface PresentationAsyncDetailRow {
+	rowKind: "detail";
+	rowKey: string;
+	text: string;
+	/** The native gutter treatment; adapters may restyle with their own. */
+	gutter: boolean;
+	tone: "dim" | "accent" | "plain";
+}
+
+export interface PresentationAsyncJobSection {
+	rowKey: string;
+	/** Header material: glyph inputs, name, state, context badge, stats text. */
+	header: {
+		name: string;
+		title: string;
+		state: string;
+		context?: string;
+		stats?: string;
+		activity?: string;
+		/** Pre-composed status glyph string (theme-applied at projection time is NOT allowed — pass inputs instead). */
+		glyphState: "running" | "queued" | "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
+		compactWorkflow: boolean;
+		singleChildJob: boolean;
+	};
+	rows: Array<PresentationAsyncDetailRow | PresentationWorkflowLaneRow | PresentationWorkflowPhaseRow | PresentationNestedRow>;
+	children: PresentationAsyncJobSection[];
+	childrenHidden?: number;
+}
+
+export interface PresentationAsyncFrame extends PresentationFrameBase {
+	surface: "async";
+	/** Owner-side adaptive tier decision; adapters draw per tier. */
+	tier: "single-line" | "full";
+	counts: PresentationAsyncCounts;
+	/** Multi-job header material ("Async agents · background"). */
+	multiHeader?: { active: boolean; anyRunning: boolean };
+	jobs: PresentationAsyncJobSection[];
+	hidden?: { running: number; finished: number };
+}
+
+export type PresentationFrame = PresentationFleetFrame | PresentationAsyncFrame;
 
 export interface PresentationLayoutRow {
 	rowKey: string;
@@ -259,13 +315,19 @@ export interface PresentationDiagnosticPayload {
 	occurrence: number;
 }
 
+/** Native drawing per surface, narrowly typed per frame shape. */
+export interface PresentationNativeAdapters {
+	fleet?: (frame: PresentationFleetFrame) => PresentationDrawResult;
+	async?: (frame: PresentationAsyncFrame) => PresentationDrawResult;
+}
+
 export interface PresentationSeamHostOptions {
 	events: PresentationEventBus;
 	session: () => string | null;
 	/** Increments whenever the host runtime is replaced (disable/session_shutdown). */
 	runtimeGeneration?: () => number;
 	/** Native drawing per surface — the fallback and default owner of last resort. */
-	native: Partial<Record<PresentationSurface, PresentationDraw>>;
+	native: PresentationNativeAdapters;
 	onAdapterChange?: (surface: PresentationSurface, active: string | undefined) => void;
 	/** Non-TUI hosts never activate; registration replies "not-ready". */
 	activated?: () => boolean;
@@ -277,6 +339,22 @@ interface RegisteredAdapter {
 	generation: number;
 	surfaces: Map<PresentationSurface, PresentationDraw>;
 	disposed: boolean;
+}
+
+/** Logical row keys of a frame, per surface shape (fleet: flat rows; async: job sections). */
+function frameRowsOf(frame: PresentationFrame): string[] {
+	if (frame.surface === "fleet") return frame.rows.map((row) => row.rowKey);
+	const keys: string[] = [];
+	for (const job of frame.jobs) {
+		keys.push(job.rowKey);
+		for (const row of job.rows) keys.push(row.rowKey);
+		for (const child of job.children) {
+			keys.push(child.rowKey);
+			for (const row of child.rows) keys.push(row.rowKey);
+		}
+		if (job.childrenHidden !== undefined && job.childrenHidden > 0) keys.push(`${job.rowKey}:children-hidden`);
+	}
+	return keys;
 }
 
 /**
@@ -346,7 +424,7 @@ export class PresentationSeamHost {
 	 * result as native-drawn.
 	 */
 	draw(surface: PresentationSurface, frame: PresentationFrame): { result: PresentationDrawResult; native: boolean } {
-		const native = this.options.native[surface];
+		const native = this.options.native[surface] as ((frame: PresentationFrame) => PresentationDrawResult) | undefined;
 		if (!native) return { result: { lines: [], layout: [] }, native: true };
 		if (!this.isReady()) return { result: native(frame), native: true };
 		const adapter = this.adapters.get(surface);
@@ -489,8 +567,9 @@ export class PresentationSeamHost {
 		const candidate = result as Partial<PresentationDrawResult>;
 		if (!Array.isArray(candidate.lines) || !Array.isArray(candidate.layout)) return false;
 		if (!candidate.lines.every((line) => typeof line === "string")) return false;
-		if (candidate.layout.length !== frame.rows.length) return false;
-		const rowKeys = new Set(frame.rows.map((row) => row.rowKey));
+		const frameRowKeys = frameRowsOf(frame);
+		if (candidate.layout.length !== frameRowKeys.length) return false;
+		const rowKeys = new Set(frameRowKeys);
 		let previousEnd = -1;
 		for (const entry of candidate.layout) {
 			if (typeof entry?.rowKey !== "string" || !rowKeys.has(entry.rowKey)) return false;
