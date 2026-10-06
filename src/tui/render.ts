@@ -3723,8 +3723,14 @@ export function renderSubagentSummary(
 		|| Boolean(details && workflowGraphHasStatus(details, ["failed"]));
 	const partial = Boolean(details && workflowGraphHasStatus(details, ["partial"]));
 	const state = running ? "running" : failed ? "failed" : stopped ? "stopped" : paused ? "paused" : partial ? "partial" : "completed";
+	// CC result-slot gutter (spec: the subagent result slot stays this
+	// extension's; the CC look nests the status line under the call row's ⎿).
+	// Running keeps a live line under the gutter — the fleet roster owns the
+	// rich live detail, this is the transcript-side status (user-reported
+	// expectation: `⎿ single · running`).
+	const gutter = theme.fg("dim", "  ⎿  ");
 	const glyph = state === "running"
-		? runningTone(theme, details?.mode === "single" && results.length === 1 ? childThinkingLevel(results[0], results[0]?.progress) : undefined)(STATIC_RUNNING_GLYPH)
+		? undefined
 		: state === "completed"
 			? theme.fg("success", "✓")
 			: state === "failed"
@@ -3732,9 +3738,10 @@ export function renderSubagentSummary(
 				: theme.fg("warning", "■");
 	const label = details?.mode === "single" && results.length === 1
 		? foregroundSingleDisplayName(results[0])
-		: details?.mode || "subagent";
+		: details?.mode === "workflow" ? "subagents" : details?.mode || "subagent";
+	const stateColor = state === "failed" ? "error" : state === "completed" ? "success" : state === "running" ? "accent" : "warning";
 	return new Text(
-		truncLine(`${glyph} ${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", "·")} ${theme.fg(state === "failed" ? "error" : state === "completed" ? "success" : state === "running" ? "accent" : "warning", state)}`, getTermWidth() - 4),
+		truncLine(`${gutter}${glyph ? `${glyph} ` : ""}${theme.fg("toolTitle", theme.bold(label))} ${theme.fg("dim", "·")} ${theme.fg(stateColor, state)}`, getTermWidth() - 4),
 		0,
 		0,
 	);

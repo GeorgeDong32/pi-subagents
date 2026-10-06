@@ -434,7 +434,12 @@ test("glyphs that stand for several children take the main session's thinking co
 		}
 
 		const summary = renderSubagentSummary({ content: [{ type: "text", text: "running" }], details } as never, { isPartial: true }, toneTheme as never);
-		assert.match(componentText(summary), /⟦thinking:xhigh⟧●⟦\/⟧/, "multi summary glyph");
+		// The transcript summary line runs under the CC ⎿ gutter with no extra
+		// running glyph (user-reported form: `⎿ <label> · running`); thinking
+		// tones stay on the result card and widget glyphs above.
+		assert.match(componentText(summary), /⟦dim⟧  ⎿  ⟦\/⟧/, "summary nests under the ⎿ gutter");
+		assert.match(componentText(summary), /⟦accent⟧running⟦\/⟧/, "summary running state reads accent");
+		assert.doesNotMatch(componentText(summary), /●/, "summary carries no status glyph of its own");
 	} finally {
 		setMainThinkingLevelSource(() => undefined);
 	}
