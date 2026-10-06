@@ -2528,7 +2528,8 @@ const RESERVED_NON_WIDGET_ROWS = 19;
 
 let widgetLayoutSession: WidgetLayoutSession | undefined;
 
-function resetWidgetLayoutSession(): void {
+/** Test seam: clear the adaptive layout session so cases render independently. */
+export function resetWidgetLayoutSession(): void {
 	widgetLayoutSession = undefined;
 }
 
