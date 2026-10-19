@@ -53,7 +53,7 @@ function mount(jobs: AsyncJobState[], options: { collapsed?: boolean; expanded?:
 			getToolsExpanded: () => options.expanded === true,
 		},
 	} as unknown as ExtensionContext;
-	renderWidget(ctx, jobs, options.collapsed === true, options.seamDraw as never);
+	renderWidget(ctx, jobs, options.collapsed === true, "adaptive", options.seamDraw as never);
 	const factory = widgetFactory as (tui: unknown, theme: unknown) => WidgetHarness;
 	const component = factory({ requestRender() {} }, theme as never);
 	return {

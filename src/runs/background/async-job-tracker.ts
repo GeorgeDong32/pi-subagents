@@ -6,6 +6,7 @@ import { formatControlNoticeMessage } from "../shared/subagent-control.ts";
 import {
 	type AsyncJobState,
 	type AsyncStartedEvent,
+	type AsyncWidgetLayout,
 	type ControlEvent,
 	type SteeringNotice,
 	type SubagentChildStatusEvent,
@@ -25,6 +26,7 @@ import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, externalJobBridgeEligibility, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
+import { withWorkflowChildRunModel } from "./workflow-terminal-proof.ts";
 import { validHostStepNodes } from "../shared/host-step-status.ts";
 import { readProcessTerminal } from "./process-terminal.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
@@ -36,15 +38,18 @@ interface AsyncJobTrackerOptions {
 	resultsDir?: string;
 	widgetEnabled?: boolean;
 	widgetCollapsed?: boolean;
+	widgetLayout?: AsyncWidgetLayout;
 	/** Presentation seam dispatcher (spec §5); absent = native composition. */
-	seamDraw?: AsyncSeamDraw;
-	platform?: NodeJS.Platform;
-	onJobTerminal?: () => void;
+	seamDraw?: AsyncSeamDraw;	platform?: NodeJS.Platform;
+	onJobTerminal?: (job: AsyncJobState) => void;
+	onJobCleanup?: (asyncId: string) => void;
 	watch?: typeof fs.watch;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
 	/** Resolve native supervisor requests without scanning supervisor mailboxes. */
 	supervisorRequestState?: (event: ControlEvent) => "pending" | "resolved" | "unknown";
+	/** Called whenever the tracked jobs changed enough to re-render the widget. */
+	onJobsChanged?: () => void;
 }
 
 const CONTROL_EVENT_READ_CHUNK_BYTES = 64 * 1024;
@@ -117,8 +122,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}, run);
 	};
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
+		options.onJobsChanged?.();
 		if (state.widgetsSuspended) return;
-		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed, options.seamDraw);
+		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed, options.widgetLayout ?? "adaptive", options.seamDraw);
 		(ctx.ui as { requestRender?: () => void }).requestRender?.();
 	};
 	const rerenderLastWidget = (jobs = Array.from(state.asyncJobs.values())) => {
@@ -138,8 +144,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (state.widgetsSuspended) return;
 			const requestRender = (ctx.ui as { requestRender?: () => void }).requestRender;
 			if (requestRender) requestRender.call(ctx.ui);
-			else renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed, options.seamDraw);
-		});
+			else
+				renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed, options.widgetLayout ?? "adaptive", options.seamDraw);		});
 	};
 	const refreshWidget = (ctx: ExtensionContext) => rerenderWidget(ctx);
 	const restoredControlEventCursor = (asyncDir: string) => {
@@ -237,6 +243,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			const job = state.asyncJobs.get(asyncId);
 			retainNestedLookupRoute(state, job?.nestedRoute, job?.sessionId);
 			state.asyncJobs.delete(asyncId);
+			options.onJobCleanup?.(asyncId);
 			rerenderLastWidget();
 		}, completionRetentionMs);
 		state.cleanupTimers.set(asyncId, timer);
@@ -519,6 +526,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				if (status.mode === "workflow") job.workflowGraph = status.workflowGraph ?? job.workflowGraph;
 				job.hostSteps = validHostStepNodes(status.workflowGraph);
 				const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
+				if (workflowChildren && status.mode === "workflow") workflowChildren.children = workflowChildren.children.map((child) => withWorkflowChildRunModel(job.asyncDir, child));
 				if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
 				job.workflowChildren = workflowChildren ?? job.workflowChildren;
 				job.currentStep = status.currentStep ?? job.currentStep;
@@ -536,6 +544,9 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						? status.steps.slice(activeGroup.start, activeGroup.start + activeGroup.count).map((step, index) => ({ ...step, index: activeGroup.start + index }))
 						: status.steps.map((step, index) => ({ ...step, index }));
 					job.activeParallelGroup = Boolean(activeGroup);
+					if (status.mode === "workflow") {
+						for (const step of visibleSteps) if (step.async === true) Object.assign(step, withWorkflowChildRunModel(job.asyncDir, step));
+					}
 					job.agents = visibleSteps.map((step) => step.agent);
 					job.steps = visibleSteps;
 					refreshNestedProjection();
@@ -577,7 +588,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 						} else cancelCleanup(job.asyncId);
 					}
 					// Scan on close too: publication may have raced the payload check.
-					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.();
+					if (!isTerminalJobStatus(previousStatus) || (wasPending && !publication?.pending)) options.onJobTerminal?.(job);
 					rememberFleetJob(state, job);
 					if (!publication?.pending && !nestedRefreshFailed && !hasLiveNestedDescendants(job.nestedChildren) && (previousStatus !== job.status || !state.cleanupTimers.has(job.asyncId))) {
 						scheduleCleanup(job.asyncId);

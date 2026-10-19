@@ -30,8 +30,9 @@ export const HOST_PEER_ALIASES: ReadonlyArray<{ specifier: string; pkg: string; 
 	{ specifier: "typebox/value", pkg: "typebox", subpath: "./value" },
 ];
 
-/** Public Pi manifests introduce chord in 0.85.0 (absent through 0.84.4). */
-const CHORD_PEER_ALIASES = [
+/** Pi manifests declare chord from 0.85.0 through 1.1.x; earlier hosts and 1.2.0+ do not ship it. */
+const CHORD_PACKAGE = "@earendil-works/chord";
+const CHORD_PEER_ALIASES: typeof HOST_PEER_ALIASES = [
 	{ specifier: "@earendil-works/chord", pkg: "@earendil-works/chord", subpath: "." },
 	{ specifier: "@earendil-works/chord/context", pkg: "@earendil-works/chord", subpath: "./context" },
 ];
@@ -40,19 +41,9 @@ interface PackageManifest {
 	name?: unknown;
 	version?: unknown;
 	main?: unknown;
-	exports?: unknown;
 	dependencies?: unknown;
-	peerDependencies?: unknown;
 	optionalDependencies?: unknown;
-}
-
-/** Does the manifest declare `pkg` in any dependency field? */
-function manifestDeclares(manifest: PackageManifest | undefined, pkg: string): boolean {
-	for (const field of ["dependencies", "peerDependencies", "optionalDependencies"] as const) {
-		const value = manifest?.[field];
-		if (value && typeof value === "object" && pkg in (value as Record<string, unknown>)) return true;
-	}
-	return false;
+	exports?: unknown;
 }
 
 function readManifest(packageDir: string): PackageManifest | undefined {
@@ -144,28 +135,27 @@ function findPeerPackageDir(piPackageRoot: string, pkg: string, hostName: unknow
 	return candidates.find((candidate) => readManifest(candidate)?.name === pkg);
 }
 
+function declaresDependency(manifest: PackageManifest, pkg: string): boolean {
+	return [manifest.dependencies, manifest.optionalDependencies].some((deps) => !!deps && typeof deps === "object" && Object.hasOwn(deps, pkg));
+}
+
 /** The alias map the runner needs, or the specifiers that could not be resolved. */
 export function resolveHostPeerAliases(piPackageRoot: string): { aliases: Record<string, string>; missing: string[] } {
 	const aliases: Record<string, string> = {};
 	const missing: string[] = [];
 	const hostManifest = readManifest(piPackageRoot);
-	// Chord joined the public manifests in 0.85.0 — and left the dependency
-	// graph again in 1.3.0 (deps/peer/optional all omit it, dist never imports
-	// it). Gate on what the host DECLARES, not on the version number: a host
-	// that declares chord but cannot resolve it is still a broken install
-	// (kept in `missing`), while an undeclared chord means the runner's import
-	// graph can never reference it, so no alias is needed (fixes async children
-	// on pi 1.3.0, which the version heuristic wrongly rejected).
-	const hostDeclaresChord = manifestDeclares(hostManifest, "@earendil-works/chord");
-	const required: ReadonlyArray<(typeof HOST_PEER_ALIASES)[number]> = [...HOST_PEER_ALIASES, ...(hostDeclaresChord ? CHORD_PEER_ALIASES : [])];
-	for (const { specifier, pkg, subpath, optional } of required) {
+	// Chord is aliased whenever the host provides it, but required only when the host
+	// manifest declares it (Pi 0.85 through 1.1), so a declared-but-missing chord still
+	// fails closed. An unreadable host manifest keeps it required rather than hiding a broken install.
+	const chordRequired = !hostManifest || declaresDependency(hostManifest, CHORD_PACKAGE);
+	for (const { specifier, pkg, subpath, optional } of [...HOST_PEER_ALIASES, ...CHORD_PEER_ALIASES]) {
 		const packageDir = findPeerPackageDir(piPackageRoot, pkg, hostManifest?.name);
 		const target = packageDir ? resolvePackageSubpath(packageDir, subpath) : undefined;
 		// An optional subpath the package does not declare is unreachable, so skip it; a declared but missing file still fails.
 		if (optional && packageDir && target === undefined) continue;
 		// Native loaders short-circuit resolution, so aliases must retain the real package's dependency scope.
 		if (target && fs.existsSync(target)) aliases[specifier] = fs.realpathSync(target);
-		else missing.push(specifier);
+		else if (pkg !== CHORD_PACKAGE || chordRequired) missing.push(specifier);
 	}
 	return { aliases, missing };
 }

@@ -204,9 +204,9 @@ export function samePath(left: string, right: string): boolean {
 	// drive/short-name aliases. The directory identity is the final bounded
 	// fallback; never accept aliases when the filesystem cannot prove identity.
 	try {
-		const leftStat = fs.statSync(left);
-		const rightStat = fs.statSync(right);
-		return leftStat.dev !== 0 && leftStat.ino !== 0 && leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
+		const leftStat = fs.statSync(left, { bigint: true });
+		const rightStat = fs.statSync(right, { bigint: true });
+		return leftStat.dev !== 0n && leftStat.ino !== 0n && leftStat.dev === rightStat.dev && leftStat.ino === rightStat.ino;
 	} catch {
 		return false;
 	}
@@ -885,7 +885,7 @@ export function formatWorktreeCleanupPlan(created: CreatedWorktreeCleanupPlan): 
 		"",
 		`Plan saved: ${planPath}`,
 		"Plan-only mode: no worktrees or branches were removed.",
-		`Apply this reviewed plan: subagent({ action: "worktree.cleanup", mode: "apply", repo: ${JSON.stringify(plan.repoRoot)}, planId: ${JSON.stringify(plan.planId)} })`,
+		`Apply this reviewed plan: subagent({ action: "worktree.cleanup", options: { mode: "apply", repo: ${JSON.stringify(plan.repoRoot)}, planId: ${JSON.stringify(plan.planId)} } })`,
 	];
 	return lines.join("\n");
 }

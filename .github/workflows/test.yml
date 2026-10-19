@@ -93,6 +93,18 @@ jobs:
       - name: Worktree cleanup and lock recovery regressions
         run: node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/worktree-cleanup-plan.test.ts test/unit/worktree-lock.test.ts test/unit/parallel-handoff.test.ts
 
+  schedule-claim-contention:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts
+      - name: Focused regressions
+        run: node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test test/unit/schedule-claim-preservation.test.ts
+
   native-nested-wait:
     strategy:
       matrix:
@@ -113,6 +125,27 @@ jobs:
           PI_SUBAGENTS_NATIVE_PI_ROOT: ${{ runner.temp }}/native-host/node_modules/@earendil-works/pi-coding-agent
           NODE_DISABLE_COMPILE_CACHE: '1'
         run: node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --import ./test/support/native-peer-loader.mjs --test test/integration/nested-async-wait.test.ts
+
+  native-mcp-readiness:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts
+      - name: Install native Pi SDK
+        run: npm install --prefix "${{ runner.temp }}/native-host" --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.2.0
+      - name: Native MCP connection readiness and cancellation
+        env:
+          PI_SUBAGENTS_NATIVE_PI_ROOT: ${{ runner.temp }}/native-host/node_modules/@earendil-works/pi-coding-agent
+          NODE_DISABLE_COMPILE_CACHE: '1'
+        run: node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --import ./test/support/native-peer-loader.mjs --test test/integration/builtin-mcp-readiness.test.ts
 
   bun-workflow-script:
     runs-on: ubuntu-latest
@@ -156,7 +189,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pi-version: ["0.86.1", "1.0.0"]
+        pi-version: ["0.86.1", "1.0.0", "1.2.0"]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -187,10 +220,9 @@ jobs:
         run: |
           node -e 'const a = require("node:assert/strict"); a.equal(process.platform, "linux"); a.equal(process.arch, "x64");'
           npm ci --ignore-scripts
-          # Bubblewrap needs only Ubuntu indexes, not the runner's third-party repositories.
-          printf '%s\n' 'deb http://archive.ubuntu.com/ubuntu jammy main universe' 'deb http://archive.ubuntu.com/ubuntu jammy-updates main universe' 'deb http://security.ubuntu.com/ubuntu jammy-security main universe' > "$RUNNER_TEMP/ubuntu.sources.list"
-          sudo apt-get -o Dir::Etc::sourcelist="$RUNNER_TEMP/ubuntu.sources.list" -o Dir::Etc::sourceparts=- update
-          sudo apt-get -o Dir::Etc::sourcelist="$RUNNER_TEMP/ubuntu.sources.list" -o Dir::Etc::sourceparts=- install -y bubblewrap
+          # Bubblewrap needs only the runner's Ubuntu mirror (sources.list), not its third-party repositories (sources.list.d).
+          sudo apt-get -o Dir::Etc::sourceparts=- update
+          sudo apt-get -o Dir::Etc::sourceparts=- install -y bubblewrap
       - name: Provision the checksum-pinned official binary
         shell: bash
         run: |

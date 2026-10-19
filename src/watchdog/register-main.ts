@@ -1,10 +1,8 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
 import { resolveEffectiveThinking, splitKnownThinkingSuffix, THINKING_LEVELS, type ThinkingLevel } from "../shared/model-info.ts";
-import { SLASH_TEXT_RESULT_TYPE } from "../shared/types.ts";
+import { SLASH_TEXT_RESULT_TYPE, SLASH_TEXT_VIEW_ONLY_DETAILS } from "../shared/types.ts";
 import { startWatchdogDiffBaselineCapture, type WatchdogDiffBaseline } from "./diff-tool.ts";
 import { formatWatchdogRecommendation, recommendWatchdogModel, resolveWatchdogModelInput, parseWatchdogThinkingInput } from "./model-selection.ts";
-import { renderWatchdogWarning } from "./render.ts";
 import { createMainWatchdogReview } from "./review.ts";
 import { MainWatchdogRuntime, type WatchdogReviewFunction } from "./runtime.ts";
 import { getWatchdogUserSettingsPath, writeUserWatchdogEnabled, writeWatchdogModelSettings } from "./settings.ts";
@@ -12,7 +10,6 @@ import {
 	SUBAGENT_WATCHDOG_WARNING_TYPE,
 	type WatchdogRuntimeStatus,
 	type WatchdogWarning,
-	type WatchdogWarningDetails,
 } from "./types.ts";
 import { createWatchdogWarningMessage } from "./warning-format.ts";
 
@@ -22,7 +19,7 @@ interface RegisterMainWatchdogOptions {
 }
 
 function sendSlashText(pi: ExtensionAPI, text: string): void {
-	pi.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true });
+	pi.sendMessage({ customType: SLASH_TEXT_RESULT_TYPE, content: text, display: true, details: SLASH_TEXT_VIEW_ONLY_DETAILS });
 }
 
 function messageFromError(error: unknown): string {
@@ -149,7 +146,7 @@ export function buildWatchdogStatus(snapshot: ReturnType<MainWatchdogRuntime["ge
 		"- /subagents-watchdog model <provider/model[:thinking]>",
 		"- /subagents-watchdog model inherit",
 		"- /subagents-watchdog session model recommended",
-		"Agent action: subagent({ action: \"watchdog.configure\", model: \"recommended\", scope: \"session\" })",
+		"Agent action: subagent({ action: \"watchdog.configure\", model: \"recommended\", options: { scope: \"session\" } })",
 	);
 	return lines.join("\n");
 }
@@ -371,19 +368,6 @@ async function handleWatchdogCommand(
 }
 
 export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatchdogOptions = {}): MainWatchdogRuntime {
-	// Surface-tuning: the watchdog itself stays available (it is default-off);
-	// only its /subagents-watchdog command is suppressed with the rest of the family.
-	const rawRegisterCommand = pi.registerCommand.bind(pi);
-	pi = new Proxy(pi, {
-		get(target, prop, receiver) {
-			if (prop === "registerCommand") {
-				return (name: string, opts: Parameters<ExtensionAPI["registerCommand"]>[1]) => {
-					if (name !== "subagents-watchdog") rawRegisterCommand(name, opts);
-				};
-			}
-			return Reflect.get(target, prop, receiver);
-		},
-	}) as typeof pi;
 	let currentContext: ExtensionContext | undefined;
 	let diffBaseline: Promise<WatchdogDiffBaseline | undefined> | undefined;
 	const rememberContext = (ctx: ExtensionContext) => {
@@ -396,23 +380,6 @@ export function registerMainWatchdog(pi: ExtensionAPI, options: RegisterMainWatc
 		displayWarning: (details, options) => pi.sendMessage(createWatchdogWarningMessage(details, { display: true, details }), options),
 		displayUserWarning: (details) => pi.appendEntry(SUBAGENT_WATCHDOG_WARNING_TYPE, details),
 		displayClarification: (content) => pi.sendMessage({ customType: "subagent_watchdog_clarification", content, display: true }, { deliverAs: "steer", triggerTurn: true }),
-	});
-
-	pi.registerMessageRenderer<WatchdogWarningDetails>(SUBAGENT_WATCHDOG_WARNING_TYPE, (message, renderOptions, theme) => {
-		const details = message.details as WatchdogWarningDetails | undefined;
-		if (!details?.summary || !details.evidence || !details.recommendedAction) {
-			const content = typeof message.content === "string"
-				? message.content
-				: message.content.filter((entry) => entry.type === "text").map((entry) => entry.text).join("\n");
-			return new Text(content, 0, 0);
-		}
-		return renderWatchdogWarning(details, renderOptions, theme);
-	});
-	pi.registerEntryRenderer<WatchdogWarningDetails>(SUBAGENT_WATCHDOG_WARNING_TYPE, (entry, renderOptions, theme) => {
-		const details = entry.data as WatchdogWarningDetails | undefined;
-		return details?.summary && details.evidence && details.recommendedAction
-			? renderWatchdogWarning(details, renderOptions, theme)
-			: undefined;
 	});
 
 	pi.registerCommand("subagents-watchdog", {

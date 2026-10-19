@@ -1,13 +1,14 @@
 import * as fs from "node:fs";
 import type { AsyncRunSummary } from "./async-status.ts";
 import { readAsyncRecoveryDescriptor } from "./async-resume.ts";
+import { errorWithoutReplyText } from "../shared/model-resolution.ts";
 
 const INTERCOM_DETACH_ERROR = "detached for intercom coordination";
 
 function isIntercomDetached(run: AsyncRunSummary): boolean {
 	return run.steps.some((step) => step.execution?.status === "detached"
-		|| step.error?.toLowerCase().includes(INTERCOM_DETACH_ERROR) === true)
-		|| run.error?.toLowerCase().includes(INTERCOM_DETACH_ERROR) === true;
+		|| errorWithoutReplyText(step.error)?.toLowerCase().includes(INTERCOM_DETACH_ERROR) === true)
+		|| errorWithoutReplyText(run.error)?.toLowerCase().includes(INTERCOM_DETACH_ERROR) === true;
 }
 
 function formatIntercomDetachGuidance(run: AsyncRunSummary): string | undefined {
@@ -25,8 +26,8 @@ export function formatAsyncReviveCommand(run: AsyncRunSummary): string | undefin
 	} catch {
 		return undefined;
 	}
-	const index = run.steps.length === 1 ? "" : `, index: ${step.index}`;
-	return `subagent({ action: "resume", id: "${run.id}"${index}, message: "Continue from the persisted child session and report the result." })`;
+	const index = run.steps.length === 1 ? "" : `, options: { index: ${step.index} }`;
+	return `subagent({ action: "resume", id: "${run.id}", message: "Continue from the persisted child session and report the result."${index} })`;
 }
 
 export function formatResumeFirstFailedRunDetail(run: AsyncRunSummary): string | undefined {

@@ -12,10 +12,12 @@ clarify → scout → worker → fresh reviewers → worker
 
 Packaged `worker` defaults to fresh context so implementation starts from its assigned brief instead of the parent's unfinished conversation. Packaged `oracle` and `advisor` default to forked context; if the parent has no persisted session file or current leaf yet, that implicit default falls back to `fresh`. Explicit `context`, `context: "profile"`, and global `defaultSubagentContext` still override these profile defaults.
 
+Launch children in the background (`async` follows `asyncByDefault`, normally true) and consume each result at the point a later step depends on it. Native completion wakes the parent session, so the parent returns control instead of sleeping or polling. Use `async: false` only when the parent must block, not for final reviews or gates. When an oracle or advisor reaches an unknown that needs a decision, it asks through supervisor dialogue; use a one-shot oracle call only when one was requested.
+
 Child-safety boundaries are enforced at runtime:
 
 - Child sessions do not receive the bundled `pi-subagents` skill.
-- Forked child context filtering removes parent-only subagent artifacts (including old hidden orchestration-instruction messages, slash/status/control messages, and prior parent `subagent` tool-call/tool-result history) while preserving ordinary prose and unrelated tool calls/results.
+- Child context filtering removes parent-only subagent artifacts (hidden orchestration-instruction messages, slash/status/control messages, and `subagent` tool-call/tool-result history) while preserving ordinary prose and unrelated tool calls/results. A forked child sends the history it inherited exactly as the parent sent it, so its first request can reuse the parent's prompt cache; it still cannot run `subagent`.
 - By default, children do not register the `subagent` tool and receive boundary instructions that they are not the parent orchestrator and must not propose or run subagents.
 - The explicit exception is an agent whose resolved builtin `tools` includes `subagent`; that child gets a child-safe `subagent` tool for the fanout work the parent assigned, still bounded by `maxSubagentDepth`.
 
@@ -27,7 +29,9 @@ Stop and report the exact failure, run/status, and repository/cwd/worktree/branc
 
 Failed workflow details and async `status.json` include `workflow.failureKind` as `validation`, `script`, `child`, `return-serialization`, `timeout`, `detached-child`, or `runtime`. `validation` means the host rejected the script before it ran (syntax or portability) or at completion (unawaited calls); errors thrown into a running script, including rejected `runs.run` parameters and runtime `SyntaxError`s, are `script` because the script could catch them, and failed children are `child`. `runtime` covers host setup and infrastructure failures, such as an unavailable cwd or a crashed worker. A workflow that is stopped or reloaded is not a failure and has no `failureKind`.
 
-When `/reload`, a session resume, or a pi-web project switch replaces the extension runtime, a running async workflow stops with `workflow.stopCause: "runtime-replaced"` in `status.json`, and its awaited async children keep running. When the same workflow script is launched again with the same `args` in that session, a `runs.run` with the same key and params returns a child that already finished successfully without launching it, and waits for a child that is still running instead of starting another. Those results carry `reused: true`, their step and trace entry are marked `reused`, and the new run records `workflow.reusedFrom`. Failed and stopped children, and children that ran in-process, launch again. Reuse applies only when the newest run of that script and args in the session was stopped this way; a user stop or a completed run ends it.
+When `/reload`, a session resume, or a pi-web project switch replaces the extension runtime, a running async workflow stops with `workflow.stopCause: "runtime-replaced"` in `status.json`, and its awaited async children keep running. Its in-process foreground children are stopped, including ones that detached to ask their supervisor. When the same workflow script is launched again with the same `args` in that session, a `runs.run` with the same key and params returns a child that already finished successfully without launching it, and waits for a child that is still running instead of starting another. Those results carry `reused: true`, their step and trace entry are marked `reused`, and the new run records `workflow.reusedFrom`. Failed and stopped children, and children that ran in-process, launch again. Reuse applies only when the newest run of that script and args in the session was stopped this way; a user stop or a completed run ends it. From another session, such as one that took over after a handoff, relaunch the same script as an async workflow with `options: { reuseFrom: "<stopped run id>" }`; the run must have stopped this way in the same cwd, and `args` may differ, because each child is still reused only when its key and params match.
+
+After `/new`, `/resume`, or a fork in the same Pi process, the new session owns the async runs of the session it replaced, and of the sessions that one replaced. It can list, `bg_wait` on, steer, stop, and resume them, receives their completion notices, and answers their children's pending supervisor requests. Over RPC, a host can steer, interrupt, stop, resume, and inspect them, and sees them in the fleet and `subagent-async` snapshots. Startup and other Pi processes inherit nothing; `/reload` adds nothing new but keeps what the session already inherited. To relaunch a stopped workflow instead of controlling its children one by one, use `options.reuseFrom`.
 
 Pi core may print a generic `pi -ne` extension-load hint; that out-of-repo hint is not protocol-approved fallback. A verified compaction abort may continue the retained child once on its already resolved model; it does not authorize an execution-mode or model switch.
 
@@ -49,6 +53,8 @@ Add `autofix` to `/parallel-review` or `/parallel-cleanup` to apply only the syn
 
 Use direct `{ agent, task }` for one bounded child. Use a workflow script when the parent needs a stable keyed child, sequence, fanout, steering, retry, or aggregation. For ordinary parallel fanout, use `await runs.all([{ key, agent, task }, ...])`. It resolves to an ordered array, not a key map, so use indexes, destructuring, or `.map(...)`, not `results.<key>`. Do not read `.output` from unawaited `runs.run` launches. Store a `runs.run` promise only when the script later observes it with `await`, `Promise.race`, or `Promise.all`, such as steering a live child before awaiting its result. Scripts are ordinary JavaScript statement bodies. Use an explicit `return` for a useful result.
 
+Use top-level `await`, plain helper functions, or Promise chains; nested async functions, async arrows, and async methods are rejected (see [opt-in bounded workflows](#opt-in-bounded-workflows)).
+
 The `workflow` field selects the script source:
 
 - `workflow: true` runs the one ```` ```js workflow ```` fenced block written in the same assistant reply as the `subagent` call. The script is plain text in the reply, so it needs no JSON string escaping. A reply can carry exactly one such block and one `workflow: true` call; zero or several blocks fail. A reply with no tagged block may instead carry exactly one plain ```` ```js ```` block, which then runs. A line containing only ```` ``` ```` (three or more backticks, optionally followed by spaces or tabs) ends the block, so keep Markdown fences inside quoted strings.
@@ -63,7 +69,7 @@ Workflow-level child controls default onto each `runs.run`/`runs.all` launch; ex
 
 Child results cross into the script as plain JSON data. Non-JSON host metadata is omitted, so use returned fields such as `runId`, `ok`, `output`, and `structuredOutput` for workflow control.
 
-Omitting a child's `async` preserves awaited final-result semantics, even if the child runs in the background. Explicit child `async: true` intentionally returns after launch: its receipt has `state: "running"`, `ok: false`, an empty `output`, and no completion error or final `outputReference`. `ok` confirms successful child completion, not successful dispatch. Use `runId` and `asyncDir` to inspect the running child; `artifactPaths` may include runtime directories and is not a list of final reports. Reusing the same workflow key returns the same receipt, not a refreshed result.
+Omitting a child's `async` preserves awaited final-result semantics, even if the child runs in the background. Explicit child `async: true` intentionally returns after launch: its receipt has `state: "running"`, `ok: false`, an empty `output`, and no completion error or final `outputReference`. `ok` confirms successful child completion, not successful dispatch. It does not confirm that the task's intent was carried out: a child that declines or cannot do the work can still end normally. When later steps depend on the work having happened, give the child an `outputSchema` with an explicit status field (and check `structuredOutput` in the script) or a host-run `gate`, and treat only that verdict as success. Use `runId` and `asyncDir` to inspect the running child; `artifactPaths` may include runtime directories and is not a list of final reports. Reusing the same workflow key returns the same receipt, not a refreshed result.
 
 A workflow can finish dispatch while these children remain running. Its summary and child rows identify that distinction, and launch receipts do not generate child-completion notices. Consume the later child result before treating its work or report as complete.
 
@@ -104,9 +110,12 @@ Use a named workflow resource when a permission or policy extension needs to dis
 ```js
 subagent({ workflow: "review", args: { task: "Review the change" } });
 subagent({ workflow: "run-ci", args: { command: "npm test" } });
+subagent({ workflow: "parallel", args: { tasks: [{ agent: "reviewer", task: "Review src/api" }, { agent: "scout", task: "Map the tests" }] } });
 ```
 
-The host resolves the name and validates bounded plain-JSON `args` before starting the workflow. Resource provenance is recorded in workflow details and receipts for downstream permission/policy checks. Resource authority is not caller-supplied: `runs.host` is available only when the resolved resource explicitly grants the requested host key and command. Reply-block (`workflow: true`) and file-path scripts remain raw, unknown-provenance inputs, so their `runs.host` calls are unavailable through the public execution boundary. Named resources cannot be combined with `agent` or `task`; this first slice ships only the package-owned `review` and `run-ci` resources, not a user/project resource registry.
+The host resolves the name and validates bounded plain-JSON `args` before starting the workflow. Resource provenance is recorded in workflow details and receipts for downstream permission/policy checks. Resource authority is not caller-supplied: `runs.host` is available only when the resolved resource explicitly grants the requested host key and command. Reply-block (`workflow: true`) and file-path scripts remain raw, unknown-provenance inputs, so their `runs.host` calls are unavailable through the public execution boundary. Named resources cannot be combined with `agent` or `task`; the package ships the `review`, `run-ci` and `parallel` resources, not a user/project resource registry.
+
+`parallel` runs independent children together without writing a script: `args.tasks` is a list of `{ agent, task }` items, the children run in one `runs.all` batch, and the result lists each child's output in order. A failed child fails the workflow. Use a workflow script when steps depend on each other.
 
 ### Opt-in bounded workflows
 
@@ -120,9 +129,11 @@ return runs.run("review", { agent: "reviewer", task: "Review:\n" + scan.output }
 ```js
 subagent({
   workflow: true,
-  timeoutMs: 900000,
-  toolBudget: { soft: 40, hard: 60 },
-  usageBudget: { tokens: { soft: 100000, hard: 150000 } }
+  options: {
+    timeoutMs: 900000,
+    toolBudget: { soft: 40, hard: 60 },
+    usageBudget: { tokens: { soft: 100000, hard: 150000 } }
+  }
 });
 ```
 
@@ -420,7 +431,7 @@ known, or for explicit emergency hotfix lanes.
 
 For watched same-repo workflows, pass `async:false` only when the parent must block until completion. That blocking mode also shows the live in-chat workflow card. `chatProgress` can force `off` or `live-card` when the automatic policy is not what you want. Blocking workflows default to a 30-minute timeout; async workflows have no default timeout. See the [tool reference](tool-reference.md) for the full parameter list.
 
-Synchronous workflows publish trace and `emit(...)` updates through the tool update callback regardless of `chatProgress`, including RPC/headless and cross-repository runs. These updates include `details.workflow` and `details.workflowChildren`; `chatProgress: "off"` disables the live card, not transport progress. Running foreground child rows additionally expose bounded `activity` (current tool, timing, and counters), plus resolved model/thinking when available, keyed by `childId`. Activity-only updates coalesce over 100 ms; lifecycle updates remain immediate. Activity clears when children settle, and is not persisted for async workflows. Tool names are limited to 256 UTF-8 bytes and each activity object is below 2 KiB (including JSON escaping); arguments and transcripts are not forwarded.
+Synchronous workflows publish trace and `emit(...)` updates through the tool update callback regardless of `chatProgress`, including RPC/headless and cross-repository runs. These updates include `details.workflow` and `details.workflowChildren`; `chatProgress: "off"` disables the live card, not transport progress. Once a child launches, its running row carries its `agent` and `runId`; for a child running in the background, that `runId` is the id of its run node in the `subagent-async` snapshot. Running foreground child rows additionally expose bounded `activity` (current tool, timing, and counters), plus resolved model/thinking when available, keyed by `childId`. Activity-only updates coalesce over 100 ms; lifecycle updates remain immediate. Activity clears when children settle, and is not persisted for async workflows. Tool names are limited to 256 UTF-8 bytes and each activity object is below 2 KiB (including JSON escaping); arguments and transcripts are not forwarded.
 
 The workflow result text keeps the Return, Emitted, and Console sections, and a failed workflow's error, under 200 KB and 5000 lines, or under `maxOutput` when set. Each call-trace error is cut to 500 characters. A cut adds a `[TRUNCATED: ... - full output at <path>]` line. The full text goes to the workflow `output` file when one is set, otherwise to `<run>_workflow-result.md` in the run's artifacts directory, outside the `outputs/` tree where children save their reports. That file has the same retention as the other run artifacts: age-based cleanup removes it from temp and session artifact directories, and `artifactDir: "project"` files are kept. The status line, the rest of each trace line, warnings, and output-path mappings are never cut. Async completion notices and `action: "status"` show short previews; a cut preview or async error ends in `…` and names the run's `status.json`, which holds the full `workflow.value`, `workflow.emits`, and `error`.
 
@@ -442,7 +453,7 @@ const [api, ui] = await runs.all([
 return { api: api.artifactPaths, ui: ui.artifactPaths };
 ```
 
-Each child uses the existing worktree lifecycle: it branches from clean HEAD, journals ownership before launch, captures a patch and handoff manifest, then removes cleanly captured temporary worktrees and branches. The handoff manifest path remains available in the child's `artifactPaths`; return or emit it when the orchestrator needs to apply or inspect the patches. `runs.ref` stays concise and intentionally omits full paths.
+Each child uses the existing worktree lifecycle: it branches from clean HEAD, journals ownership before launch, captures a patch and handoff manifest, then removes cleanly captured temporary worktrees and branches. The handoff manifest path remains available in the child's `artifactPaths`; return or emit it when the orchestrator needs to apply or inspect the patches. `worktree.cleanup` scans only the repository's project artifacts, so a workflow child's worktree is reported as unknown until you pass that manifest as `options.handoffPath`; worktrees of retained, resumable children are then kept rather than removed. `runs.ref` stays concise and intentionally omits full paths.
 
 A top-level `{ workflow: true, worktree: true }` makes isolation the default for every workflow child. An individual child can override that default with `worktree: false`. Keep one writer when parallel writes are not intentionally isolated.
 
@@ -485,7 +496,7 @@ Inspect the handoff before reconciliation; cleanup still requires fresh checks.
 
 ## Supervisor coordination (child asks parent)
 
-Child agents can talk back to the parent Pi session without installing `pi-intercom`. `pi-subagents` provides the child-facing `contact_supervisor` tool and the parent-facing `subagent_supervisor({ action: "reply" })` path natively. Generic `intercom` remains available only when an explicitly loaded external provider supplies it.
+Child agents can talk back to the parent Pi session without installing `pi-intercom`. `pi-subagents` provides the child-facing `contact_supervisor` tool and the parent-facing `subagent_supervisor({ action: "reply" })` path natively. A session that has `subagent` also declares `contact_supervisor`, so a forked child's tools match its parent's; there it only returns an error saying the session has no supervisor. Generic `intercom` remains available only when an explicitly loaded external provider supplies it.
 
 Use it for work where the child might need a decision instead of guessing:
 
@@ -517,7 +528,7 @@ For A → B → C, C's request belongs to B, not A. B can escalate a separate qu
 
 Child-side routine completion handoffs are not expected. If a child appears stalled, needs-attention notices show up in the parent session with useful next actions, such as checking `subagent({ action: "status" })`, interrupting the run, or nudging the child.
 
-If a workflow script child detaches through `contact_supervisor`, the enclosing async workflow stays `paused` until that child exits. Then the extension reconciles it to `complete` or `failed`. Wait on the child until that happens.
+If a workflow script child detaches through `contact_supervisor`, the enclosing async workflow stays `paused` until that child exits. Then the extension reconciles it to `complete` or `failed`. Wait on the child until that happens. A detached child that runs in-process (not as an async child) is stopped if the extension runtime is replaced before it finishes; `status` on its run id then shows it as stopped with the reason.
 
 If messages do not show up, run `/subagents-doctor`. Advanced users can tune the bridge with `intercomBridge` in [configuration.md](configuration.md).
 

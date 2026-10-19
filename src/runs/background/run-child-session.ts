@@ -7,7 +7,8 @@
  */
 import type { Message } from "@earendil-works/pi-ai";
 import type { ChildTranscriptWriter } from "../../shared/child-transcript.ts";
-import { extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
+import { SUBAGENT_STOPPED_MESSAGE, SUBAGENT_TIMED_OUT_MESSAGE, assistantMessageError, extractTextFromContent, extractToolArgsPreview, getFinalOutput, hasEmptyTerminalAssistantResponse } from "../../shared/utils.ts";
+import { qualifyModelWithProvider } from "../../shared/model-info.ts";
 import type { EffectsProjection, RuntimeAcknowledgedChildExtensions, SubagentOutputState, ToolBudgetState, Usage } from "../../shared/types.ts";
 import {
 	acceptChildWatchdogEvent,
@@ -205,8 +206,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let abortSettleTimer: NodeJS.Timeout | undefined;
 		let childWatchdogState: ChildWatchdogStateSnapshot | undefined;
 		const childLifecycleState: ChildLifecycleState = { compactionRetryActive: false };
-		const timeoutMessage = () => input.timeoutMessage ?? "Subagent timed out.";
-		const stopMessage = () => input.stopMessage ?? "Subagent stopped by user.";
+		const timeoutMessage = () => input.timeoutMessage ?? SUBAGENT_TIMED_OUT_MESSAGE;
+		const stopMessage = () => input.stopMessage ?? SUBAGENT_STOPPED_MESSAGE;
 
 		type ActiveToolCall = { key: string; tool: string; args?: string; path?: string };
 		let activeToolSequence = 0;
@@ -250,10 +251,12 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			refreshCurrentTool();
 		};
 
+		const startup = new AbortController();
 		const abortChild = (): void => {
 			if (settled || promptSettled) return;
-			// A hung session creation has no session to abort yet; the settle timer below is the only
-			// thing that ends the run, and a session created afterwards is disposed by the launch block.
+			startup.abort();
+			// MCP startup can now stop before a session is returned. The timer still bounds
+			// other creation work that does not observe the startup signal.
 			void session?.abort().catch(() => {
 				// The run settles through its prompt promise; abort failures are not separately actionable.
 			});
@@ -488,18 +491,11 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				return;
 			}
 
-			if ((event.type === "message_end" || event.type === "tool_result_end") && event.message) {
-				if (event.type === "tool_result_end") {
-					clearActiveToolTimeout(event);
-					removeActiveToolCall({
-						toolCallId: (event.message as { toolCallId?: unknown }).toolCallId ?? event.toolCallId,
-						toolName: (event.message as { toolName?: unknown }).toolName ?? event.toolName,
-					});
-				}
+			if (event.type === "message_end" && event.message) {
 				messages.push(event.message);
 				const text = extractTextFromContent(event.message.content);
 				if (text) writeOutputText(text);
-				if (event.type === "message_end" && event.message.role === "user" && text) {
+				if (event.message.role === "user" && text) {
 					const matched = takeMatchingAcceptedSteer(acceptedSteers, text);
 					if (matched) {
 						input.onSteerOutcome?.(matched.request, {
@@ -510,20 +506,20 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					}
 				}
 
-				if (input.childWatchdog && event.type === "message_end") {
+				if (input.childWatchdog) {
 					const next = applyChildWatchdogMessage(childWatchdogState, event.message);
 					if (next) childWatchdogState = next;
 				}
-				if (event.type !== "message_end" || event.message.role !== "assistant") return;
+				if (event.message.role !== "assistant") return;
 				const hasToolCall = assistantStartsToolCall(event.message);
 				if (event.message.model) {
-					model = event.message.model;
+					model = qualifyModelWithProvider(event.message.model, event.message.provider, input.modelVerificationRegistry) ?? event.message.model;
 					if (input.expectedModelForVerification && !hasToolCall) {
 						const modelVerificationError = formatSubagentModelVerificationError(input.expectedModelForVerification, event.message.model, input.modelVerificationRegistry, input.modelResponseAliases, session?.virtualModelId);
 						if (modelVerificationError && !error) error = modelVerificationError;
 					}
 				}
-				if (event.message.errorMessage) assistantError = event.message.errorMessage;
+				if (event.message.errorMessage) assistantError = assistantMessageError(event.message);
 				else if (hasToolCall && event.message.stopReason === "toolUse") {
 					// A recovered request can finish via a terminating tool, without a text stop.
 					assistantError = undefined;
@@ -671,6 +667,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		void (async () => {
 			try {
 				const createInput = createReportedChildSessionInput(input.launch, input.transcriptWriter);
+				createInput.signal = startup.signal;
 				const created = await input.factory.create(createInput);
 				if (settled) {
 					await created.dispose().catch(() => undefined);

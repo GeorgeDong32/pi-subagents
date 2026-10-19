@@ -6,6 +6,7 @@ import { describe, it } from "node:test";
 import { applySteeringRecoveryAgentConfig, asyncReviveRequiresRecoveryDescriptor, buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
+import { recordSessionReplacement } from "../../src/shared/session-succession.ts";
 
 function writeJson(filePath: string, value: object): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -919,6 +920,37 @@ describe("async resume lookup", () => {
 		}
 	});
 
+	it("revives a run of a session this process replaced, and still refuses other sessions' runs", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-inherited-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "child.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			const [replaced, successor, unrelated] = ["replaced", "successor", "unrelated"].map((name) => path.join(root, `${name}.jsonl`));
+			writeJson(path.join(asyncRoot, "failed-child", "status.json"), {
+				runId: "failed-child",
+				sessionId: replaced,
+				mode: "single",
+				state: "failed",
+				startedAt: 100,
+				endedAt: 200,
+				cwd: root,
+				sessionFile,
+				steps: [{ agent: "worker", status: "failed", sessionFile }],
+			});
+			const resume = (sessionId: string) => resolveAsyncResumeTarget({ id: "failed-child" }, { asyncDirRoot: asyncRoot, resultsDir }, { sessionId });
+			assert.throws(() => resume(successor), /not found in the active session/);
+			recordSessionReplacement(successor, replaced);
+			const target = resume(successor);
+			assert.equal(target.kind, "revive");
+			assert.equal(target.sessionFile, sessionFile);
+			assert.throws(() => resume(unrelated), /not found in the active session/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("revives a completed child by index while a sibling async child is still running", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-partial-"));
 		try {
@@ -1042,6 +1074,33 @@ describe("async resume lookup", () => {
 			assert.equal(target.sessionFile, secondSession);
 			assert.equal(target.model, "anthropic/claude-sonnet-4");
 			assert.equal(target.thinking, "high");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("revives on the launch model when status reports a model a host extension switched to and no result exists yet", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-routed-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const resultsDir = path.join(root, "results");
+			const sessionFile = path.join(root, "a.jsonl");
+			fs.writeFileSync(sessionFile, "", "utf-8");
+			writeJson(path.join(asyncRoot, "run-routed", "status.json"), {
+				runId: "run-routed",
+				mode: "parallel",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [
+					{ agent: "worker", status: "complete", sessionFile, model: "openai-codex/gpt-6-sol", launchModel: "llama-swap/qwen3.5:9b", thinking: "high" },
+					{ agent: "worker", status: "running" },
+				],
+			});
+
+			const target = resolveAsyncResumeTarget({ id: "run-routed", index: 0 }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.equal(target.kind, "revive");
+			assert.equal(target.model, "llama-swap/qwen3.5:9b");
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

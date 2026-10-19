@@ -18,11 +18,14 @@ import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { createNestedRoute, nestedResultsPath } from "../../src/runs/shared/nested-events.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
-import { INTERCOM_SESSION_IDENTITY_EVENT, SUBAGENT_ASYNC_COMPLETE_EVENT, TEMP_ROOT_DIR, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type SubagentState } from "../../src/shared/types.ts";
+import { createChildHooks } from "../../src/runs/shared/child-hooks.ts";
+import { ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
+import { INTERCOM_SESSION_IDENTITY_EVENT, SUBAGENT_ASYNC_COMPLETE_EVENT, SUBAGENT_ASYNC_STARTED_EVENT, TEMP_ROOT_DIR, SUBAGENT_FOREGROUND_COMPLETE_EVENT, type SubagentState } from "../../src/shared/types.ts";
 import registerSubagentPromptRuntime, {
 	CHILD_FANOUT_BOUNDARY_INSTRUCTIONS,
 	CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS,
 	registerPermissionGate,
+	registerSubagentPromptBoundary,
 	rewriteSubagentPrompt,
 	stripGlobalContext,
 	stripInheritedSkills,
@@ -174,6 +177,66 @@ it("registered child bg_wait discovers nested personas and agent_end drains the 
 	} finally {
 		fs.rmSync(asyncRoot, { recursive: true, force: true });
 		fs.rmSync(path.dirname(resultPath), { recursive: true, force: true });
+		fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+	}
+});
+
+it("fanout child bg_wait yields to a descendant's supervisor request while the awaited run is still running", async () => {
+	const route = createNestedRoute(randomUUID());
+	const runId = randomUUID();
+	const asyncRoot = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId);
+	const asyncDir = path.join(asyncRoot, runId);
+	const channelDir = resolveSupervisorChannelDir(runId, "worker", 0);
+	const sessionFile = "fanout-coordinator-session.jsonl";
+	const ownerSessionId = `coordinator-${randomUUID()}`;
+	const requestId = `ask-${randomUUID()}`;
+	const handlers = new Map<string, Function[]>();
+	const events = createEventBus();
+	const tools = new Map<string, { execute: Function }>();
+	const ctx = {
+		cwd: process.cwd(), hasUI: false, isIdle: () => false,
+		sessionManager: { getSessionFile: () => sessionFile, getSessionId: () => ownerSessionId, getEntries: () => [] },
+	};
+	// SAFETY: this fixture supplies the registration/event APIs both child hooks use; other calls are inert.
+	const pi = new Proxy({
+		events,
+		on: (event: string, fn: Function) => {
+			handlers.set(event, [...(handlers.get(event) ?? []), fn]);
+			return () => handlers.set(event, (handlers.get(event) ?? []).filter((candidate) => candidate !== fn));
+		},
+		registerTool: (tool: { name: string; execute: Function }) => tools.set(tool.name, tool),
+		getAllTools: () => [...tools.keys()].map((name) => ({ name })),
+	}, { get: (target, prop) => prop in target ? target[prop as keyof typeof target] : () => undefined }) as never;
+	try {
+		fs.mkdirSync(asyncDir, { recursive: true });
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+			runId, sessionId: sessionFile, mode: "workflow", state: "running", pid: process.pid,
+			startedAt: Date.now(), lastUpdate: Date.now(), steps: [{ agent: "worker", status: "running" }],
+		}));
+		updateActiveRunIndex(asyncDir, "running");
+		// Real hook order: the prompt runtime registers bg_wait before fanout-child installs the supervisor channel.
+		for (const hook of createChildHooks(childConfig({ fanoutChild: true, nestedRoute: route }))) hook.factory(pi);
+		for (const fn of handlers.get("session_start") ?? []) await fn({ reason: "startup" }, ctx);
+		events.emit(SUBAGENT_ASYNC_STARTED_EVENT, { id: runId, asyncDir, sessionId: sessionFile, agents: ["worker"] });
+
+		const startedAt = Date.now();
+		const waiting = tools.get("bg_wait")!.execute("wait", { id: runId, timeoutMs: 3000 }, new AbortController().signal, undefined, ctx);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		ensureSupervisorChannelDir(channelDir);
+		fs.writeFileSync(path.join(channelDir, "requests", `${requestId}.json`), JSON.stringify({
+			type: "subagent.supervisor.request", id: requestId, createdAt: Date.now(), expiresAt: Date.now() + 60_000,
+			reason: "need_decision", message: "Choose the safe path", expectsReply: true,
+			orchestratorSessionId: ownerSessionId, runId, agent: "worker", childIndex: 0,
+		}));
+
+		const result = await waiting;
+		assert.deepEqual(result.details.wait, { reason: "supervisor_request", timedOut: false, activeRunIds: [runId], activeProviderItems: [] });
+		assert.ok(Date.now() - startedAt < 2500, "bg_wait did not yield before its window elapsed");
+		assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8")).state, "running");
+	} finally {
+		for (const fn of handlers.get("session_shutdown") ?? []) await fn({}, ctx);
+		fs.rmSync(asyncRoot, { recursive: true, force: true });
+		fs.rmSync(channelDir, { recursive: true, force: true });
 		fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
 	}
 });
@@ -688,13 +751,23 @@ describe("subagent prompt runtime", () => {
 			inheritSkills: true,
 		});
 
-		assert.ok(rewritten.startsWith(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS));
+		assert.ok(rewritten.endsWith(`\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`));
 		assert.ok(rewritten.includes("Do not propose or run subagents."));
 		assert.ok(rewritten.includes("If you need to edit files, use the available editing tools."));
 		assert.ok(!rewritten.includes("call the actual edit/write tools"));
 		assert.ok(rewritten.includes("Do not print tool-call syntax, patches, or pseudo-tool calls as text."));
-		assert.equal(rewriteSubagentPrompt(rewritten, { inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }).indexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), 0);
-		assert.equal(rewriteSubagentPrompt(rewritten, { inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }).lastIndexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), 0);
+		assert.equal(rewriteSubagentPrompt(rewritten, { inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }), rewritten);
+	});
+
+	it("keeps Pi's base prompt first and appends the boundary and structured-output instructions once", () => {
+		const piPrompt = "You are an expert coding assistant operating inside pi, a coding agent harness.\n\nAvailable tools:\n- read\n\nCurrent working directory: /repo";
+		const options = { inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true, structuredOutput: true };
+		const rewritten = rewriteSubagentPrompt(piPrompt, options);
+
+		assert.ok(rewritten.startsWith("You are an expert coding assistant operating inside pi"));
+		assert.ok(rewritten.indexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS) > rewritten.indexOf("Current working directory: /repo"));
+		assert.ok(rewritten.endsWith("if you do not call `structured_output`, the parent will fail this step."));
+		assert.equal(rewriteSubagentPrompt(rewritten, options), rewritten);
 	});
 
 	it("replaces inherited child boundaries with the fanout boundary when authorized", () => {
@@ -706,12 +779,13 @@ describe("subagent prompt runtime", () => {
 			fanoutChild: true,
 		});
 
-		assert.ok(rewritten.startsWith(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS));
+		assert.ok(rewritten.startsWith("You are a subagent."));
+		assert.ok(rewritten.endsWith(`\n\n${CHILD_FANOUT_BOUNDARY_INSTRUCTIONS}`));
 		assert.ok(rewritten.includes("You may use the `subagent` tool only for the fanout work explicitly requested in this task."));
 		assert.ok(rewritten.includes("If you need to edit files, use the available editing tools."));
 		assert.ok(!rewritten.includes("call the actual edit/write tools"));
 		assert.ok(!rewritten.includes("Do not propose or run subagents."));
-		assert.equal(rewritten.lastIndexOf(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS), 0);
+		assert.equal(rewritten.indexOf(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS), rewritten.lastIndexOf(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS));
 	});
 
 	it("replaces inherited fanout boundaries with the strict boundary when fanout is not authorized", () => {
@@ -722,9 +796,10 @@ describe("subagent prompt runtime", () => {
 			inheritSkills: true,
 		});
 
-		assert.ok(rewritten.startsWith(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS));
+		assert.ok(rewritten.startsWith("You are a subagent."));
+		assert.ok(rewritten.endsWith(`\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`));
 		assert.ok(!rewritten.includes("explicit fanout responsibility"));
-		assert.equal(rewritten.lastIndexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), 0);
+		assert.equal(rewritten.indexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS), rewritten.lastIndexOf(CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS));
 	});
 
 	it("keeps explicitly injected skill content when inherited skills are stripped", () => {
@@ -778,7 +853,7 @@ describe("subagent prompt runtime", () => {
 		assert.ok(rewritten.includes("<skill name=\"safe-bash\">"));
 	});
 
-	it("strips parent-only subagent custom messages from forked child context", () => {
+	it("strips parent-only subagent custom messages from a child's context outside inherited fork history", () => {
 		const user = { role: "user", content: "Task" };
 		const instruction = { role: "custom", customType: "subagent-orchestration-instructions", content: "Subagent orchestration is enabled." };
 		const slashResult = { role: "custom", customType: "subagent-slash-result", content: "## Orchestration" };
@@ -792,7 +867,7 @@ describe("subagent prompt runtime", () => {
 		assert.deepEqual(stripParentOnlySubagentMessages([user, instruction, slashResult, slashTextResult, notify, control, watchdogWarning, childWatchdogWarning, otherCustom]), [user, otherCustom]);
 	});
 
-	it("strips prior parent subagent tool calls and results from forked child context", () => {
+	it("strips subagent tool calls and results from a child's context outside inherited fork history", () => {
 		const user = { role: "user", content: "Task" };
 		const subagentResult = { role: "toolResult", toolName: "subagent", content: "subagent results" };
 		const readResult = { role: "toolResult", toolName: "read", content: "file contents" };
@@ -1073,36 +1148,39 @@ describe("subagent prompt runtime", () => {
 		});
 	}
 
-	it("rewrites the final child-visible prompt through before_agent_start", async () => {
-		let beforeAgentStart: ((event: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) | undefined;
+	it("filters parent-only context out of the prompt inputs in place without replacing the prompt", async () => {
+		let beforeAgentStart: ((event: unknown) => Promise<unknown>) | undefined;
 		registerSubagentPromptRuntime({
-			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
+			on(event: string, handler: (payload: unknown) => Promise<unknown>) {
 				if (event === "before_agent_start") beforeAgentStart = handler;
 			},
-			getAllTools: () => [{ name: "intercom" }, { name: "contact_supervisor" }],
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }> }, childConfig({ inheritProjectContext: false, inheritGlobalContext: true, inheritSkills: false }));
+			getAllTools: () => [],
+		} as never, childConfig({ inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: true }));
+		const options = {
+			customPrompt: `Role.\n\n<skill name="pi-subagents">\nOrchestrate.\n</skill>\n\n${CHILD_FANOUT_BOUNDARY_INSTRUCTIONS}`,
+			appendSystemPrompt: `Extra.\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}`,
+			contextFiles: [{ path: path.join(getAgentDir(), "AGENTS.md"), content: "Global" }, { path: "/repo/AGENTS.md", content: "Repo" }],
+			skills: [{ name: "pi-subagents" }, { name: "safe-bash" }],
+			sections: {},
+		};
 
-		assert.ok(beforeAgentStart, "expected before_agent_start handler");
-
-		const rewritten = await beforeAgentStart?.({ systemPrompt: BASE_PROMPT });
-		assert.ok(rewritten);
-		assert.ok(!rewritten.systemPrompt.includes("# Project Context"));
-		assert.ok(!rewritten.systemPrompt.includes("<available_skills>"));
-		assert.ok(rewritten.systemPrompt.includes("Current date: 2026-04-16"));
+		assert.equal(await beforeAgentStart?.({ systemPrompt: "rendered", systemPromptOptions: options }), undefined);
+		assert.deepEqual(options.contextFiles.map((file) => file.content), ["Repo"]);
+		assert.deepEqual(options.skills.map((skill) => skill.name), ["safe-bash"]);
+		assert.equal(options.customPrompt, "Role.");
+		assert.equal(options.appendSystemPrompt, "Extra.");
 	});
 
-	it("uses the fanout boundary through before_agent_start for a fanout child", async () => {
-		let beforeAgentStart: ((event: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) | undefined;
-		registerSubagentPromptRuntime({
-			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
-				if (event === "before_agent_start") beforeAgentStart = handler;
-			},
-			getAllTools: () => [{ name: "intercom" }, { name: "contact_supervisor" }],
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }> }, childConfig({ fanoutChild: true, inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }));
+	it("appends the child boundary once to the complete prompt, after another extension's own prompt", () => {
+		const handlers: Array<(event: { systemPrompt: string }) => { systemPrompt: string } | undefined> = [];
+		const api = { on: (_event: string, handler: (typeof handlers)[number]) => handlers.push(handler) } as never;
+		registerSubagentPromptBoundary(api, childConfig({ fanoutChild: true, inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: true }));
+		registerSubagentPromptBoundary(api, childConfig());
 
-		const rewritten = await beforeAgentStart?.({ systemPrompt: BASE_PROMPT });
-		assert.ok(rewritten);
-		assert.ok(rewritten.systemPrompt.startsWith(CHILD_FANOUT_BOUNDARY_INSTRUCTIONS));
+		assert.equal(handlers.length, 1, "inert without inheritance settings or fanout");
+		const finalized = handlers[0]!({ systemPrompt: `Own prompt.\n\n${CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS}` });
+		assert.equal(finalized?.systemPrompt, `Own prompt.\n\n${CHILD_FANOUT_BOUNDARY_INSTRUCTIONS}`);
+		assert.equal(handlers[0]!({ systemPrompt: finalized!.systemPrompt }), undefined);
 	});
 
 	it("filters parent-only artifacts from polluted fork context while preserving ordinary history", () => {

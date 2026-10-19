@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DIRS, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
+import { DIRS, RUNNER_LAUNCHER_NAME_PATTERN, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
 import { snapshotRequiredChildExtensions } from "../../shared/required-child-extensions.ts";
@@ -9,6 +9,7 @@ import { validateAcceptanceInput } from "../shared/acceptance.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { intersectSubagentCapabilityCeilings, normalizeCapabilityCeilingAllowedAgents, parseSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { validateRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
+import { ownsRun } from "../shared/run-ownership.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
 import { resultFilePath, resultPayloadPathForIndexedRun } from "./result-files.ts";
 import { canScanAsyncRunPrefix, MIN_SAFE_ASYNC_RUN_PREFIX_LENGTH } from "./run-id-query.ts";
@@ -285,6 +286,7 @@ function validateStatusForResume(status: AsyncStatus | null, source: string): vo
 			if (stepRecord.sessionFile !== undefined && typeof stepRecord.sessionFile !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].sessionFile must be a string.`);
 			if (stepRecord.sessionName !== undefined && typeof stepRecord.sessionName !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].sessionName must be a string.`);
 			if (stepRecord.model !== undefined && typeof stepRecord.model !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].model must be a string.`);
+			if (stepRecord.launchModel !== undefined && typeof stepRecord.launchModel !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].launchModel must be a string.`);
 			if (stepRecord.thinking !== undefined && typeof stepRecord.thinking !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].thinking must be a string.`);
 			if (stepRecord.thinkingCeiling !== undefined) stepRecord.thinkingCeiling = parseThinkingLevel(stepRecord.thinkingCeiling, `async status '${source}' steps[${index}].thinkingCeiling`);
 			if (stepRecord.launchContractDigest !== undefined && typeof stepRecord.launchContractDigest !== "string") throw new Error(`Invalid async status '${source}': steps[${index}].launchContractDigest must be a string.`);
@@ -327,7 +329,7 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 		"subagentOnlyExtensions", "mcpDirectTools", "excludeTools", "mutationTools", "systemPrompt", "systemPromptMode", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "skills",
 		"skillPath", "agentFilePath", "memory", "outputPath", "outputMode", "structuredOutputSchema", "acceptance", "sessionDir", "artifactConfig",
 		"artifactsDir", "maxOutput", "controlConfig", "context", "intercomBridge", "absoluteDeadlineAt", "initialTurnBudget", "initialToolBudget", "maxSubagentDepth", "share", "capabilityCeiling",
-		"launchResolvedExtensions", "runFanoutBudget", "lane", "baseRef",
+		"launchResolvedExtensions", "runFanoutBudget", "lane", "baseRef", "launcher",
 		"extensionBindings",
 		"requiredExtensions",
 	]);
@@ -339,6 +341,7 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 		if (typeof parsed[field] !== "string" || !(parsed[field] as string).trim()) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${field} must be a non-empty string.`);
 	}
 	if (parsed.version !== 1) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': version must be 1.`);
+	if (parsed.launcher !== undefined && (typeof parsed.launcher !== "string" || !RUNNER_LAUNCHER_NAME_PATTERN.test(parsed.launcher))) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': launcher must be a launcher name.`);
 	try {
 		parsed.runFanoutBudget = validateRunFanoutBudgetDescriptor(parsed.runFanoutBudget);
 	} catch (error) {
@@ -481,7 +484,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	const result = location.resultPath ? readResultFile(location.resultPath) : undefined;
 	const runId = status?.runId ?? result?.runId ?? result?.id ?? location.resolvedId ?? (location.asyncDir ? path.basename(location.asyncDir) : "unknown");
 	const mode = resumeTargetMode(status, result);
-	if (options.sessionId && ((status && status.sessionId !== options.sessionId) || (result && result.sessionId !== options.sessionId))) {
+	if (options.sessionId && ((status && !ownsRun(options.sessionId, status.sessionId)) || (result && !ownsRun(options.sessionId, result.sessionId)))) {
 		throw new Error(`Async run '${runId}' was not found in the active session.`);
 	}
 	if (recoveryDescriptor && recoveryDescriptor.sourceRunId !== runId) throw new Error(`Async run '${runId}' has a recovery descriptor for a different source run.`);
@@ -575,7 +578,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		?? (stepCount === 1 ? status?.sessionFile ?? result?.sessionFile : undefined);
 	if (!sessionFile && requireSessionFile) throw new Error(`Async run '${runId}' child ${index} does not have a persisted session file to resume from.`);
 	const resolvedSessionFile = sessionFile ? validateResumeSessionFile(runId, sessionFile) : undefined;
-	const stepModel = statusSteps[index]?.model ?? resultSteps[index]?.model ?? (stepCount === 1 ? result?.model : undefined);
+	const stepModel = statusSteps[index]?.launchModel ?? statusSteps[index]?.model ?? resultSteps[index]?.model ?? (stepCount === 1 ? result?.model : undefined);
 	const stepThinking = statusSteps[index]?.thinking ?? resultSteps[index]?.thinking ?? (stepCount === 1 ? result?.thinking : undefined);
 	const thinkingCeiling = statusSteps[index]?.thinkingCeiling ?? (stepCount === 1 ? recoveryDescriptor?.thinkingCeiling : undefined);
 	const capabilityCeiling = mode === "workflow"
@@ -636,6 +639,8 @@ export function applySteeringRecoveryAgentConfig(agentConfig: AgentConfig, descr
 		output: descriptor.outputPath,
 		toolBudget: descriptor.initialToolBudget,
 		maxSubagentDepth: descriptor.maxSubagentDepth,
+		// The recorded launcher wins over the current agent file, including recorded absence.
+		launcher: descriptor.launcher,
 	};
 }
 
