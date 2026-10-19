@@ -41,6 +41,18 @@ interface PackageManifest {
 	version?: unknown;
 	main?: unknown;
 	exports?: unknown;
+	dependencies?: unknown;
+	peerDependencies?: unknown;
+	optionalDependencies?: unknown;
+}
+
+/** Does the manifest declare `pkg` in any dependency field? */
+function manifestDeclares(manifest: PackageManifest | undefined, pkg: string): boolean {
+	for (const field of ["dependencies", "peerDependencies", "optionalDependencies"] as const) {
+		const value = manifest?.[field];
+		if (value && typeof value === "object" && pkg in (value as Record<string, unknown>)) return true;
+	}
+	return false;
 }
 
 function readManifest(packageDir: string): PackageManifest | undefined {
@@ -137,11 +149,15 @@ export function resolveHostPeerAliases(piPackageRoot: string): { aliases: Record
 	const aliases: Record<string, string> = {};
 	const missing: string[] = [];
 	const hostManifest = readManifest(piPackageRoot);
-	// Only known stable pre-chord versions may omit it. Unknown/prerelease
-	// hosts retain the required aliases, rather than hiding a broken install.
-	const stableVersion = typeof hostManifest?.version === "string" ? /^0\.(\d+)\.\d+$/.exec(hostManifest.version) : null;
-	const isPreChord = stableVersion !== null && Number(stableVersion[1]) < 85;
-	const required: ReadonlyArray<(typeof HOST_PEER_ALIASES)[number]> = [...HOST_PEER_ALIASES, ...(isPreChord ? [] : CHORD_PEER_ALIASES)];
+	// Chord joined the public manifests in 0.85.0 — and left the dependency
+	// graph again in 1.3.0 (deps/peer/optional all omit it, dist never imports
+	// it). Gate on what the host DECLARES, not on the version number: a host
+	// that declares chord but cannot resolve it is still a broken install
+	// (kept in `missing`), while an undeclared chord means the runner's import
+	// graph can never reference it, so no alias is needed (fixes async children
+	// on pi 1.3.0, which the version heuristic wrongly rejected).
+	const hostDeclaresChord = manifestDeclares(hostManifest, "@earendil-works/chord");
+	const required: ReadonlyArray<(typeof HOST_PEER_ALIASES)[number]> = [...HOST_PEER_ALIASES, ...(hostDeclaresChord ? CHORD_PEER_ALIASES : [])];
 	for (const { specifier, pkg, subpath, optional } of required) {
 		const packageDir = findPeerPackageDir(piPackageRoot, pkg, hostManifest?.name);
 		const target = packageDir ? resolvePackageSubpath(packageDir, subpath) : undefined;
