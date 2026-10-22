@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fork (presentation-seam) — not upstream
+
+- Chat message blocks (supervisor asks and reminders, completion and steering notices, bg_wait wakes, watchdog warnings, supervisor replies) now render as CC-style `⎿` result rows instead of upstream's `[subagent]` custom-message box: dim gutter, tone-colored status word, `(ctrl+o to expand)` hint, and the expanded body wrapped under the gutter with 5-space continuations — the same convention as the fork's other CC rows. Click and Pi's expand key keep their native toggle semantics.
+
 ## [0.79.1] - 2026-10-17
 
 ### Fork (presentation-seam) — not upstream

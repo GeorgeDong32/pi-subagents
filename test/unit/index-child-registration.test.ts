@@ -1571,7 +1571,7 @@ describe("subagent extension child mode", () => {
 		assert.deepEqual(output.entryTypes, ["subagent_supervisor_reply", "subagent_watchdog_warning"]);
 		for (const [type, lines] of [...output.blocks.messages, ...output.blocks.entries]) {
 			assert.equal(lines.length, 1, type);
-			assert.match(lines[0]!, /^ \[subagent\] .+ \(click to expand\)$/, type);
+			assert.match(lines[0]!, /^  ⎿  .+ \(ctrl\+o to expand\)$/, type);
 		}
 	});
 

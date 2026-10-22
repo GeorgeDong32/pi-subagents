@@ -1,5 +1,5 @@
-import { getMarkdownTheme, keyText, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
-import { Box, Container, Markdown, MouseRegion, Spacer, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { keyText, type Theme } from "@earendil-works/pi-coding-agent";
+import { Container, MouseRegion, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { SUBAGENT_CONTROL_MESSAGE_TYPE } from "../extension/control-notices.ts";
 import { SUBAGENT_STEERING_MESSAGE_TYPE } from "../extension/steering-notices.ts";
 import { parseSupervisorReplyData, parseSupervisorRequestDetails, SUPERVISOR_REPLY_ENTRY_TYPE, SUPERVISOR_REQUEST_MESSAGE_TYPE } from "../intercom/supervisor-ui.ts";
@@ -24,19 +24,6 @@ interface SubagentEntry {
 type Headline = ReadonlyArray<string | { status: string }>;
 
 type MessageKind = "ask" | "reply" | "result" | "attention" | "watchdog";
-
-/**
- * Theme colors for the label. Pi's themes offer few non-status colors that read
- * apart, so asks and attention notices, both a child needing the parent, share one,
- * and replies, the parent's own words, take the quiet text color.
- */
-const KIND_LABEL_COLORS = {
-	ask: "customMessageLabel",
-	attention: "customMessageLabel",
-	reply: "customMessageText",
-	result: "mdLink",
-	watchdog: "toolTitle",
-} as const satisfies Record<MessageKind, ThemeColor>;
 
 interface BlockView {
 	kind: MessageKind;
@@ -238,11 +225,11 @@ function headlineText(headline: Headline, theme: Theme): string {
 			plain += word;
 			continue;
 		}
-		if (plain) text += theme.fg("customMessageText", safeTerminalText(plain));
+		if (plain) text += theme.fg("dim", safeTerminalText(plain));
 		plain = "";
 		text += theme.fg(tone, word);
 	}
-	return plain ? text + theme.fg("customMessageText", safeTerminalText(plain)) : text;
+	return plain ? text + theme.fg("dim", safeTerminalText(plain)) : text;
 }
 
 /**
@@ -251,15 +238,52 @@ function headlineText(headline: Headline, theme: Theme): string {
  */
 const clickedBlocks = new WeakMap<SubagentMessage | SubagentEntry, { expandedByPi: boolean; expanded: boolean }>();
 
-/** The block Pi draws for its own [skill] and [compaction] messages. */
-class SubagentMessageBlock extends Box {
+/**
+ * One CC-style ⎿ result row (fork CC parity, 2026-10-20). Upstream styles
+ * these messages after Pi's own [skill]/[compaction] box — bold [subagent]
+ * label on customMessageBg, markdown body. This fork's transcript is
+ * CC-styled, so the notices join the CC terminal-row family instead: dim ⎿
+ * gutter, tone-colored status word, hint "(ctrl+o to expand)", body wrapped
+ * under the gutter with 5-space continuations — the same convention as the
+ * fork's other CC rows (render.ts result slots). Click and Pi's expand key
+ * keep their native toggle semantics.
+ */
+const GUTTER = "  ⎿  ";
+const CONTINUATION = "     ";
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** Wrap one sanitized line to maxWidth grapheme clusters; an empty line stays one empty row. */
+function wrapLine(text: string, maxWidth: number): string[] {
+	if (maxWidth <= 0) return [""];
+	if (visibleWidth(text) <= maxWidth) return [text];
+	const rows: string[] = [];
+	let current = "";
+	let currentWidth = 0;
+	for (const { segment: grapheme } of graphemeSegmenter.segment(text)) {
+		const width = visibleWidth(grapheme);
+		if (width > maxWidth) continue;
+		if (currentWidth > 0 && currentWidth + width > maxWidth) {
+			rows.push(current);
+			current = grapheme;
+			currentWidth = width;
+			continue;
+		}
+		current += grapheme;
+		currentWidth += width;
+	}
+	rows.push(current);
+	return rows;
+}
+
+class SubagentMessageBlock extends Container {
 	private readonly source: SubagentMessage | SubagentEntry;
 	private readonly view: BlockView;
 	private readonly expandedByPi: boolean;
 	private readonly theme: Theme;
 
 	constructor(source: SubagentMessage | SubagentEntry, view: BlockView, expandedByPi: boolean, theme: Theme) {
-		super(1, 1, (text) => theme.bg("customMessageBg", text));
+		super();
 		this.source = source;
 		this.view = view;
 		this.expandedByPi = expandedByPi;
@@ -276,13 +300,17 @@ class SubagentMessageBlock extends Box {
 	private rebuild(): void {
 		const { theme, view } = this;
 		const content = new Container();
-		const title = `${theme.fg(KIND_LABEL_COLORS[view.kind], theme.bold("[subagent]"))} ${headlineText(view.headline, theme)}`;
+		const head = `${theme.fg("dim", GUTTER)}${headlineText(view.headline, theme)}`;
+		const expandHint = keyText("app.tools.expand") || "ctrl+o";
 		const expanded = this.isExpanded();
-		const line = expanded ? title : `${title} ${theme.fg("dim", `(${keyText("app.tools.expand") || "click"} to expand)`)}`;
-		content.addChild({ render: (width) => [truncateToWidth(line, width, "…")], invalidate() {} });
+		const line = expanded ? head : `${head} ${theme.fg("dim", `(${expandHint} to expand)`)}`;
+		content.addChild({ render: (width: number) => [truncateToWidth(line, width, "…")], invalidate() {} });
 		if (expanded && view.body.trim()) {
-			content.addChild(new Spacer(1));
-			content.addChild(new Markdown(safeTerminalText(view.body), 0, 0, getMarkdownTheme(), { color: (text) => theme.fg("customMessageText", text) }));
+			const bodyLines = safeTerminalText(view.body).replace(/\n+$/, "").split("\n");
+			content.addChild({
+				invalidate() {},
+				render: (width: number) => bodyLines.flatMap((body) => wrapLine(body, Math.max(1, width - CONTINUATION.length)).map((rowText) => (rowText ? `${CONTINUATION}${theme.fg("dim", rowText)}` : ""))),
+			});
 		}
 		this.clear();
 		this.addChild(new MouseRegion(content, (event) => {
