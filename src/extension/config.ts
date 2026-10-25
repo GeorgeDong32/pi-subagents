@@ -199,6 +199,12 @@ function validateConfig(config: Record<string, unknown>): void {
 	if (config.pinToolDeclarations !== undefined && typeof config.pinToolDeclarations !== "boolean") {
 		throw new Error("config.pinToolDeclarations must be a boolean");
 	}
+	if (config.enableSlashCommands !== undefined && typeof config.enableSlashCommands !== "boolean") {
+		throw new Error("config.enableSlashCommands must be a boolean");
+	}
+	if (config.autoResume !== undefined && typeof config.autoResume !== "boolean") {
+		throw new Error("config.autoResume must be a boolean");
+	}
 	if (config.toolActivation !== undefined && config.toolActivation !== "auto" && config.toolActivation !== "dynamic" && config.toolActivation !== "eager") {
 		throw new Error('config.toolActivation must be "auto", "dynamic", or "eager"');
 	}

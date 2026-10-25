@@ -42,6 +42,8 @@ function foldBlock(block: string): string {
 /**
  * Normalize a simple-scalar frontmatter list from comma-separated or block-list syntax.
  * Only the standard `- item` marker is removed; ordinary hyphenated values stay intact.
+ * A trailing ` #...` comment is dropped from unquoted `- item` lines. Single-line values are left
+ * alone because parseFrontmatter has already removed their quotes, so `"notes #1.md"` must survive.
  */
 export function parseFrontmatterList(raw: string | undefined): string[] | undefined {
 	if (raw === undefined) return undefined;
@@ -49,11 +51,24 @@ export function parseFrontmatterList(raw: string | undefined): string[] | undefi
 		.split("\n")
 		.flatMap((line) => {
 			const value = line.trim();
-			const listItem = value.match(/^-\s+(.+)$/);
-			return (listItem?.[1] ?? value).split(",");
+			const listItem = value.match(/^-\s+(.+)$/)?.[1];
+			const item = listItem === undefined || /^["']/.test(listItem) ? listItem ?? value : listItem.replace(/(?:^|\s)#.*$/, "");
+			return item.split(",");
 		})
 		.map((value) => value.trim())
 		.filter(Boolean);
+}
+
+function unquoteName(value: string): string {
+	if (value.length >= 2 && ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith('"') && value.endsWith('"')))) {
+		return value.slice(1, -1);
+	}
+	return value;
+}
+
+/** A tool or extension name list whose items may each be quoted, as in `"read", "bash"` or `- "read"`. */
+export function parseUnquotedList(raw: string | undefined): string[] | undefined {
+	return parseFrontmatterList(raw)?.map(unquoteName);
 }
 
 /**
@@ -89,6 +104,10 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 		const indent = line.search(/\S|$/); // position of first non-whitespace char
 		const trimmed = line.trim();
 
+		// Comment lines are content only inside a | or > block scalar. Elsewhere they must
+		// neither end a pending list block nor become part of its value.
+		if (trimmed.startsWith("#") && !currentFolded && !currentLiteral) continue;
+
 		if (currentKey !== null && currentBlockLines !== null && (indent > (currentIndent ?? 0) || ((currentFolded || currentLiteral) && trimmed === ""))) {
 			// This line is part of the current block value
 			currentBlockLines.push(line);
@@ -118,7 +137,11 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 			const [key, rawValueValue] = match.slice(1);
 			if (key === undefined || rawValueValue === undefined) continue;
 			const rawValue = rawValueValue.trim();
-			const isQuoted = (rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith("'") && rawValue.endsWith("'"));
+			const quote = rawValue[0];
+			const nameList = key === "tools" || key === "excludeTools" || key === "mutationTools" || key === "extensions" || key === "subagentOnlyExtensions";
+			// `"read", "bash"` starts and ends with a quote, but it is a list. Keep those item quotes for the splitter.
+			const quotedList = nameList && (quote === '"' || quote === "'") && (rawValue.includes(`${quote},`) || rawValue.includes(`, ${quote}`));
+			const isQuoted = !quotedList && (quote === '"' || quote === "'") && rawValue.endsWith(quote);
 			const value = isQuoted ? rawValue.slice(1, -1) : rawValue;
 			const isFolded = !isQuoted && (rawValue === ">" || rawValue === ">-");
 			const isLiteral = !isQuoted && (rawValue === "|" || rawValue === "|-");

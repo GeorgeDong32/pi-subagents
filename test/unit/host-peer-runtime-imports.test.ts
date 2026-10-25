@@ -99,7 +99,15 @@ test("every host peer package the detached async runner imports is aliased to th
 	assert.ok(packageRoot, "expected the pi package (or its test shim) to be resolvable");
 	const resolved = resolveHostPeerAliases(packageRoot);
 	assert.deepEqual(resolved.missing, []);
-	for (const specifier of aliased) assert.ok(fs.existsSync(resolved.aliases[specifier]!), `alias target for ${specifier} exists`);
+	// Optional subpaths the installed host does not export (pi-agent-core "./node" on Pi 1.2.0) resolve to no alias.
+	for (const specifier of aliased) if (specifier in resolved.aliases) assert.ok(fs.existsSync(resolved.aliases[specifier]!), `alias target for ${specifier} exists`);
+});
+
+test("the standalone inspector runner reaches no host peer package, because its jiti has no alias map", () => {
+	// inspector-runner.mjs runs `createJiti(import.meta.url)` from the installed package, where host peers are absent.
+	const { violations, visited } = unaliasedHostPeerImports(path.join(projectRoot, "src", "inspectors", "inspector-runner.ts"), new Set());
+	assert.equal(violations.length, 0, `inspector import graph reaches host peer package(s):\n${violations.join("\n")}`);
+	assert.ok(visited > 20, `expected a non-trivial reachable file set (a broken resolver could undercount it), got ${visited}`);
 });
 
 test("the standalone inspector runner reaches no host peer package, because its jiti has no alias map", () => {

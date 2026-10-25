@@ -10,23 +10,11 @@ import {
 	buildSubagentToolPromptMetadata,
 	COMPACT_SUBAGENT_TOOL_DESCRIPTION,
 	DEFAULT_SUBAGENT_TOOL_DESCRIPTION,
-	SUBAGENT_LABEL_GUIDANCE,
 	FULL_SUBAGENT_TOOL_DESCRIPTION,
 	SUBAGENT_SAFETY_GUIDANCE,
 	SUBAGENT_TOOL_PROMPT_SNIPPET,
 } from "../../src/extension/tool-description.ts";
 import { SUBAGENT_CHILD_ENV } from "../../src/runs/shared/child-runtime-config.ts";
-
-// Surface tuning: label guidance lives inside every assembled description
-// (default/compact/full/custom); pin its presence and that the safety posture
-// stays the final section.
-function assertLabelGuidancePlacement(description: string): void {
-	assert.ok(description.includes(SUBAGENT_LABEL_GUIDANCE), "tool description must instruct the model to fill `label`");
-	assert.ok(
-		description.lastIndexOf(SUBAGENT_SAFETY_GUIDANCE) > description.lastIndexOf(SUBAGENT_LABEL_GUIDANCE),
-		"safety guidance must remain the final section after the label guidance",
-	);
-}
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -64,11 +52,10 @@ describe("registered subagent tool description", () => {
 	});
 
 	it("uses a one-line snippet only by default", () => {
-		const defaultDescription = buildSubagentToolDescription();
-	assert.equal(defaultDescription, DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
-	assertLabelGuidancePlacement(defaultDescription); // surface-tuning: label guidance rides along, safety stays final
+		assert.equal(buildSubagentToolDescription(), DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
 		assert.deepEqual(buildSubagentToolPromptMetadata(), { promptSnippet: SUBAGENT_TOOL_PROMPT_SNIPPET });
-		assert.ok(!SUBAGENT_TOOL_PROMPT_SNIPPET.includes("\n"));		for (const toolDescriptionMode of ["full", "compact", "custom"] as const) {
+		assert.ok(!SUBAGENT_TOOL_PROMPT_SNIPPET.includes("\n"));
+		for (const toolDescriptionMode of ["full", "compact", "custom"] as const) {
 			assert.deepEqual(buildSubagentToolPromptMetadata({ toolDescriptionMode }), {});
 		}
 	});
@@ -95,12 +82,8 @@ describe("registered subagent tool description", () => {
 	});
 
 	it("keeps full mode supplemental details and moves recipes to shipped guides", () => {
-		const fullDescription = buildSubagentToolDescription({ toolDescriptionMode: "full" });
-		const compactDescription = buildSubagentToolDescription({ toolDescriptionMode: "compact" });
-		assert.equal(fullDescription, FULL_SUBAGENT_TOOL_DESCRIPTION);
-		assert.equal(compactDescription, COMPACT_SUBAGENT_TOOL_DESCRIPTION);
-		assertLabelGuidancePlacement(fullDescription);
-		assertLabelGuidancePlacement(compactDescription);
+		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "full" }), FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "compact" }), COMPACT_SUBAGENT_TOOL_DESCRIPTION);
 		assert.ok(COMPACT_SUBAGENT_TOOL_DESCRIPTION.length < FULL_SUBAGENT_TOOL_DESCRIPTION.length);
 		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /runs.lanes.*structuredOutput.verdict === 'blocked'.*never reviewer prose/);
 		assert.match(FULL_SUBAGENT_TOOL_DESCRIPTION, /mission:false.*state.get.*state.set/);
@@ -144,7 +127,6 @@ describe("registered subagent tool description", () => {
 		assert.match(description, new RegExp(escapeRegex(agentDir)));
 		assert.match(description, new RegExp(escapeRegex(projectConfigDir)));
 		assert.match(description, /SAFETY-CRITICAL SUBAGENT GUIDANCE/);
-		assertLabelGuidancePlacement(description);
 		assert.equal(warnings.length, 0);
 	});
 
@@ -227,7 +209,6 @@ describe("registered subagent tool description", () => {
 		);
 
 		assert.equal(description, FULL_SUBAGENT_TOOL_DESCRIPTION);
-		assertLabelGuidancePlacement(description);
 		assert.ok(warnings.some((message) => message.includes("using full description")));
 	});
 
@@ -240,7 +221,6 @@ describe("registered subagent tool description", () => {
 		);
 
 		assert.equal(description, FULL_SUBAGENT_TOOL_DESCRIPTION);
-		assertLabelGuidancePlacement(description);
 		assert.ok(warnings.some((message) => message.includes("Ignoring invalid toolDescriptionMode")));
 	});
 
@@ -293,7 +273,6 @@ describe("registered subagent tool description", () => {
 		writeExtensionConfig(defaultAgentDir, {});
 		const defaultTool = readRegisteredTool(defaultAgentDir);
 		assert.equal(defaultTool.description, DEFAULT_SUBAGENT_TOOL_DESCRIPTION);
-		assertLabelGuidancePlacement(defaultTool.description);
 		assert.equal(defaultTool.properties.includes("step"), false);
 		assert.doesNotMatch(defaultTool.description, /append-step|approve-checkpoint|reject-checkpoint/);
 		assert.equal(defaultTool.promptSnippet, SUBAGENT_TOOL_PROMPT_SNIPPET);
@@ -303,7 +282,6 @@ describe("registered subagent tool description", () => {
 		writeExtensionConfig(fullAgentDir, { toolDescriptionMode: "full" });
 		const fullTool = readRegisteredTool(fullAgentDir);
 		assert.equal(fullTool.description, FULL_SUBAGENT_TOOL_DESCRIPTION);
-		assertLabelGuidancePlacement(fullTool.description);
 		assert.equal(fullTool.promptSnippet, undefined);
 		assert.equal(fullTool.promptGuidelines, undefined);
 
@@ -311,7 +289,6 @@ describe("registered subagent tool description", () => {
 		writeExtensionConfig(compactAgentDir, { toolDescriptionMode: "compact" });
 		const compactTool = readRegisteredTool(compactAgentDir);
 		assert.equal(compactTool.description, COMPACT_SUBAGENT_TOOL_DESCRIPTION);
-		assertLabelGuidancePlacement(compactTool.description);
 		assert.equal(compactTool.promptSnippet, undefined);
 		assert.equal(compactTool.promptGuidelines, undefined);
 

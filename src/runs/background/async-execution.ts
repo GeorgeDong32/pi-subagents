@@ -15,7 +15,7 @@ import { childCacheRetentionEnv } from "../../shared/child-cache-retention.ts";
 import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { planChildLaunch, projectChainOutputSchemas, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
-import { formatHerdrMachineRunnerUnsupported, resolveHerdrMachinePlacement } from "../shared/herdr-machine.ts";
+import { formatHerdrMachineRunnerUnsupported, resolveMachinePlacement } from "../shared/herdr-machine.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/child-tool-plan.ts";
 import { assertClaudeCodeModelScope, isClaudeCodeAdapterId, resolveClaudeCodeOverride, type ClaudeCodeOverride } from "../shared/claude-code-adapter.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
@@ -50,7 +50,7 @@ import {
 	type ArtifactConfig,
 	type Details,
 	type IntercomBridgeConfig,
-	type HerdrMachineReference,
+	type PlacementMachineReference,
 	type JsonSchemaObject,
 	type MaxOutputConfig,
 	type NestedRouteInfo,
@@ -83,8 +83,9 @@ import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal
 import { persistRunnerStartupFailure } from "./runner-startup-failure.ts";
 import type { ActiveAsyncCapacityHandle } from "./active-async-capacity.ts";
 import { statusStepDescription } from "./chain-append.ts";
+import { currentBootId, currentRecordedPid } from "./boot-id.ts";
 import { currentPidNamespaceScope } from "./pid-namespace.ts";
-import { checkPidLiveness } from "./stale-run-reconciler.ts";
+import { checkRecordedPidLiveness } from "./stale-run-reconciler.ts";
 import { lookupRunnerLauncher, resolveAgentRunnerLauncher, runnerLauncherPlacementError } from "../shared/runner-launcher.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT, type RunnerLauncher } from "../../shared/types.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -195,7 +196,6 @@ interface AsyncExecutionContext {
 export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
 
 interface AsyncChainParams {
-	label?: string;
 	chain: ChainStep[];
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -261,9 +261,9 @@ interface AsyncChainParams {
 }
 
 interface AsyncSingleParams {
-	label?: string;
 	/** Originating executor invocation, distinct from the async run id. */
-	toolCallId?: string;	agent: string;
+	toolCallId?: string;
+	agent: string;
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
 	goal?: string;
@@ -704,7 +704,12 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	const runnerProcessInstanceId = randomUUID();
 	const hasRevivalLease = typeof (cfg as { revivalLease?: unknown }).revivalLease === "object";
 	const launchBarrierToken = hasRevivalLease ? undefined : runnerProcessInstanceId;
-	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
+	// A broker launcher may start the runner outside its own process, even under another kernel, so the
+	// spawned pid is only the wrapper's and only a direct runner shares Pi's boot id. The runner reports
+	// its own identity before it is allowed to proceed.
+	const launcher = (cfg as { launcher?: RunnerLauncher }).launcher;
+	const bootId = launcher ? undefined : currentBootId();
+	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}), ...(bootId ? { bootId } : {}) };
 	writePrivateAtomicJson(cfgPath, launchConfig);
 	const command = binaryHost ?? nodeExecutable;
 	const launchForStartup = launchConfig as typeof launchConfig & { asyncDir?: unknown; id?: unknown; sessionId?: unknown; completionOwnerId?: unknown; revivalLease?: unknown };
@@ -724,9 +729,6 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	if (startupAckPath) fs.rmSync(startupAckPath, { force: true });
 	if (startupConfirmPath) fs.rmSync(startupConfirmPath, { force: true });
 	if (startupProceedPath) fs.rmSync(startupProceedPath, { force: true });
-	// A broker launcher may start the runner outside its own process, so the spawned pid is only the
-	// wrapper's. The runner reports its own identity before it is allowed to proceed.
-	const launcher = (launchConfig as { launcher?: RunnerLauncher }).launcher;
 	const identityPath = launcher && launchBarrierToken && launchAsyncDir ? path.join(launchAsyncDir, "runner-startup.json") : undefined;
 	if (identityPath) fs.rmSync(identityPath, { force: true });
 	let runnerIdentity: { pid: number; pidNamespaceScope?: string } | undefined;
@@ -812,7 +814,8 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 				}
 				// The runner may outlive its wrapper; only a confirmed-dead runner in this pid namespace finalizes here,
 				// otherwise status-pid reconciliation does it later.
-				if (!runnerIdentity || runnerIdentity.pidNamespaceScope !== currentPidNamespaceScope() || checkPidLiveness(runnerIdentity.pid, process.kill, runnerIdentity.pidNamespaceScope !== undefined) !== "dead") return;
+				if (!runnerIdentity || runnerIdentity.pidNamespaceScope !== currentPidNamespaceScope()
+					|| checkRecordedPidLiveness(runnerIdentity) !== "dead") return;
 			}
 			finalizeProcessTerminal(asyncDir, runId, {
 				processInstanceId: runnerProcessInstanceId,
@@ -868,7 +871,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		try {
 			writePrivateAtomicJson(initialStatusPath, {
 				...initialStatus,
-				...(launcher ? {} : { pid: proc.pid, pidNamespaceScope: currentPidNamespaceScope() }),
+				...(launcher ? {} : { pid: proc.pid, pidNamespaceScope: currentPidNamespaceScope(), ...(bootId ? { bootId } : {}) }),
 				processTerminal: { version: 1, state: "pending", runId: initialStatus.runId, runnerProcessInstanceId },
 			});
 			// Aggregate waits must see the launch before the runner's first status update.
@@ -1079,11 +1082,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		} catch (error) {
 			throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 		}
-		let machine: HerdrMachineReference | undefined;
+		let machine: PlacementMachineReference | undefined;
 		let machineEnv: Record<string, string> | undefined;
 		if (requestedMachine) {
 			try {
-				const placement = resolveHerdrMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: s.cwd ?? params.machineCwd });
+				const placement = resolveMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: s.cwd ?? params.machineCwd });
 				machine = placement.machine;
 				machineEnv = placement.env;
 			} catch (error) {
@@ -1599,6 +1602,7 @@ export function executeAsyncChain(
 	}
 	const initialStatusAt = Date.now();
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
+	const completionOwnerProcess = currentRecordedPid();
 	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
 	try {
 		writeRetainedRequiredChildExtensions(asyncDir, params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(launchParentSessionId ?? undefined));
@@ -1624,6 +1628,7 @@ export function executeAsyncChain(
 				asyncDir,
 				sessionId: ctx.currentSessionId,
 				completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
+				completionOwnerProcess,
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
 				childSessionFactoryModule: childSessionFactoryModule(),
@@ -1665,6 +1670,7 @@ export function executeAsyncChain(
 				runId: id,
 				...(ctx.currentSessionId ? { sessionId: ctx.currentSessionId } : {}),
 				...(initialCompletionOwnerId ? { completionOwnerId: initialCompletionOwnerId } : {}),
+				completionOwnerProcess,
 				mode: resultMode,
 				state: "running",
 				startedAt: initialStatusAt,
@@ -1781,7 +1787,6 @@ export function executeAsyncChain(
 			agents: flatAgents,
 			task: firstTask?.trim() ? PROMPT_REDACTED : undefined,
 			goal: workflowGoal?.trim() ? PROMPT_REDACTED : undefined,
-			...(typeof params.label === "string" && params.label.trim() ? { label: params.label.trim() } : {}),
 			chain: eventChain.map((s) =>
 				isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : isDynamicParallelStep(s) ? `expand:${s.parallel.agent}` : (s as SequentialStep).agent,
 			),
@@ -1903,11 +1908,11 @@ export function executeAsyncSingle(
 	} catch (error) {
 		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 	}
-	let machine: HerdrMachineReference | undefined;
+	let machine: PlacementMachineReference | undefined;
 	let machineEnv: Record<string, string> | undefined;
 	if (requestedMachine) {
 		try {
-			const placement = resolveHerdrMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: params.machineCwd });
+			const placement = resolveMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: params.machineCwd });
 			machine = placement.machine;
 			machineEnv = placement.env;
 		} catch (error) {
@@ -2187,6 +2192,7 @@ export function executeAsyncSingle(
 	let spawnResultOrPromise: SpawnRunnerResult | Promise<SpawnRunnerResult> = {};
 	const initialStatusAt = Date.now();
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
+	const completionOwnerProcess = currentRecordedPid();
 	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
 	try {
 		spawnResultOrPromise = spawnRunner(
@@ -2270,6 +2276,7 @@ export function executeAsyncSingle(
 				asyncDir,
 				sessionId: ctx.currentSessionId,
 				completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
+				completionOwnerProcess,
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
 				childSessionFactoryModule: childSessionFactoryModule(),
@@ -2314,6 +2321,7 @@ export function executeAsyncSingle(
 				runId: id,
 				...(ctx.currentSessionId ? { sessionId: ctx.currentSessionId } : {}),
 				...(initialCompletionOwnerId ? { completionOwnerId: initialCompletionOwnerId } : {}),
+				completionOwnerProcess,
 				mode: "single",
 				...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
 				state: "running",
@@ -2396,7 +2404,6 @@ export function executeAsyncSingle(
 			agent,
 			task: task?.trim() ? PROMPT_REDACTED : undefined,
 			goal: (params.goal ?? task).trim() ? PROMPT_REDACTED : undefined,
-			...(typeof params.label === "string" && params.label.trim() ? { label: params.label.trim() } : {}),
 			cwd: runnerCwd,
 			asyncDir,
 			...(sessionRoot ? { sessionRoot } : {}),

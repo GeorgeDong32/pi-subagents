@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { renderWidget, widgetRenderKey, type AsyncSeamDraw } from "../../tui/render.ts";
+import { renderWidget, widgetRenderKey } from "../../tui/render.ts";
 import { formatControlNoticeMessage } from "../shared/subagent-control.ts";
 import {
 	type AsyncJobState,
@@ -23,6 +23,7 @@ import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { reconcileAsyncRun, reconcileNestedAsyncDescendants } from "./stale-run-reconciler.ts";
 import { findNestedRouteForRootId, hasLiveNestedDescendants, retainNestedLookupRoute, updateAsyncJobNestedProjection } from "../shared/nested-events.ts";
 import { listAsyncRuns, type AsyncRunSummary } from "./async-status.ts";
+import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR, externalJobBridgeEligibility, serviceExternalJobBridgeRequests } from "../shared/external-job-bridge.ts";
 import { shouldUseNativeFsWatch } from "../../shared/watch-strategy.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
@@ -30,6 +31,8 @@ import { withWorkflowChildRunModel } from "./workflow-terminal-proof.ts";
 import { validHostStepNodes } from "../shared/host-step-status.ts";
 import { readProcessTerminal } from "./process-terminal.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
+import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
+import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -40,9 +43,12 @@ interface AsyncJobTrackerOptions {
 	widgetCollapsed?: boolean;
 	widgetLayout?: AsyncWidgetLayout;
 	/** Presentation seam dispatcher (spec §5); absent = native composition. */
-	seamDraw?: AsyncSeamDraw;	platform?: NodeJS.Platform;
+	seamDraw?: Parameters<typeof renderWidget>[4];
+	platform?: NodeJS.Platform;
 	onJobTerminal?: (job: AsyncJobState) => void;
 	onJobCleanup?: (asyncId: string) => void;
+	/** Lets a run whose launching Pi exited hold its publication in the session that owns it. */
+	deliveryOwnerId?: ResultDeliveryOwnership["deliveryOwnerId"];
 	watch?: typeof fs.watch;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
@@ -77,26 +83,18 @@ function rememberFleetJob(state: SubagentState, job: AsyncJobState): void {
 	for (const stale of terminal.slice(MAX_RECENT_FLEET_JOBS)) state.fleetJobs.delete(stale.asyncId);
 }
 
-// Surface tuning: parent-side label stash keyed by async run id. The runner
-// event path and disk summaries redact task text (containment), so the label
-// the model wrote for the UI is remembered here instead — never persisted.
-const dispatchLabels = new Map<string, string>();
-export function rememberDispatchLabel(runId: string, label: string): void {
-	if (runId && label) dispatchLabels.set(runId, label.trim());
-}
-export interface AsyncJobTracker {
+export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: SubagentState, asyncDirRoot: string, options: AsyncJobTrackerOptions = {}): {
 	ensurePoller: () => void;
 	refreshWidget: (ctx: ExtensionContext) => void;
 	handleStarted: (data: unknown) => void;
 	handleComplete: (data: unknown) => void;
 	resetJobs: (ctx?: ExtensionContext) => void;
-	restoreActiveJobs: (ctx?: ExtensionContext) => void;
+	/** `observeStatus` also sees the statuses of other sessions' runs that the listing skips. */
+	restoreActiveJobs: (ctx?: ExtensionContext, observeStatus?: RawDrainStatusObserver) => void;
 	dispose: () => void;
 	/** Invalidate the mounted async widget (presentation-seam adapter changes). */
 	rerenderAsyncWidget: () => void;
-}
-
-export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: SubagentState, asyncDirRoot: string, options: AsyncJobTrackerOptions = {}): AsyncJobTracker {
+} {
 	const completionRetentionMs = options.completionRetentionMs ?? 10000;
 	const livenessIntervalMs = options.pollIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS;
 	const resultsDir = options.resultsDir ?? DIRS.results;
@@ -124,7 +122,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
 		options.onJobsChanged?.();
 		if (state.widgetsSuspended) return;
-		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed, options.widgetLayout ?? "adaptive", options.seamDraw);
+		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed, options.widgetLayout, options.seamDraw);
 		(ctx.ui as { requestRender?: () => void }).requestRender?.();
 	};
 	const rerenderLastWidget = (jobs = Array.from(state.asyncJobs.values())) => {
@@ -144,8 +142,8 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (state.widgetsSuspended) return;
 			const requestRender = (ctx.ui as { requestRender?: () => void }).requestRender;
 			if (requestRender) requestRender.call(ctx.ui);
-			else
-				renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed, options.widgetLayout ?? "adaptive", options.seamDraw);		});
+			else renderWidget(ctx, Array.from(state.asyncJobs.values()), options.widgetCollapsed, options.widgetLayout, options.seamDraw);
+		});
 	};
 	const refreshWidget = (ctx: ExtensionContext) => rerenderWidget(ctx);
 	const restoredControlEventCursor = (asyncDir: string) => {
@@ -165,9 +163,6 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}
 	};
 	const summaryToJob = (run: AsyncRunSummary): AsyncJobState => {
-		// Surface tuning: merge the parent-side dispatch label (in-memory only —
-		// disk summaries stay redacted per containment design).
-		const dispatchLabel = dispatchLabels.get(run.id);
 		const groups = normalizeParallelGroups(run.parallelGroups, run.steps.length, run.chainStepCount ?? run.steps.length);
 		const activeGroup = run.currentStep !== undefined
 			? groups.find((group) => run.currentStep! >= group.start && run.currentStep! < group.start + group.count)
@@ -191,7 +186,6 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			steering: run.steering,
 			mode: run.mode,
 			context: run.context,
-			...(dispatchLabel ? { label: dispatchLabel } : {}),
 			cwd: run.cwd,
 			sessionRoot: run.sessionRoot,
 			agents: visibleSteps.map((step) => step.agent),
@@ -569,8 +563,11 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 				if (isTerminalJobStatus(job.status)) {
 					let publication = terminalPublications.get(job.asyncId);
 					if (!publication && status.mode !== "workflow" && status.processTerminal?.state === "pending"
-						&& status.runId === job.asyncId && status.sessionId === state.currentSessionId
-						&& status.completionOwnerId && status.completionOwnerId === state.completionOwnerId) {
+						&& status.runId === job.asyncId && status.completionOwnerId
+						&& ((status.sessionId === state.currentSessionId && status.completionOwnerId === state.completionOwnerId)
+							// Also covers a session inherited after /new or /resume: deliveryOwnerId checks run ownership.
+							|| (typeof status.sessionId === "string"
+								&& options.deliveryOwnerId?.(status.sessionId, status.completionOwnerId, status.completionOwnerProcess, status.parentWorkflowRunId) === OWNING_SESSION_COMPLETION_OWNER))) {
 						publication = { instanceId: status.processTerminal.runnerProcessInstanceId, pending: true };
 						terminalPublications.set(job.asyncId, publication);
 					}
@@ -772,7 +769,6 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			...(typeof info.completionOwnerId === "string" ? { completionOwnerId: info.completionOwnerId } : {}),
 			mode: info.mode ?? (info.chain ? "chain" : "single"),
 			description: info.goal ?? info.task,
-			...(typeof (info as { label?: unknown }).label === "string" && (info as { label?: string }).label!.trim() ? { label: (info as { label?: string }).label!.trim() } : {}),
 			agents,
 			chainStepCount: info.chainStepCount,
 			parallelGroups: validParallelGroups,
@@ -799,7 +795,6 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 
 	const handleComplete = (data: unknown) => {
-		if ((data as { id?: string } | null)?.id) dispatchLabels.delete((data as { id: string }).id);
 		const result = data as { id?: string; success?: boolean; state?: AsyncJobState["status"]; asyncDir?: string; sessionId?: string; stopped?: boolean };
 		if (typeof state.currentSessionId === "string" && result.sessionId !== state.currentSessionId) return;
 		const asyncId = result.id;
@@ -864,13 +859,14 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 		}
 	};
 
-	const restoreActiveJobs = (ctx?: ExtensionContext) => {
+	const restoreActiveJobs = (ctx?: ExtensionContext, observeStatus?: RawDrainStatusObserver) => {
 		if (ctx?.hasUI) state.lastUiContext = ctx;
 		state.statusProjectionSessionId = null;
 		if (!state.currentSessionId) return;
 		let runs: AsyncRunSummary[];
 		try {
-			runs = listAsyncRuns(asyncDirRoot, { states: ["queued", "running"], sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now });
+			// A workflow whose Pi exited is repaired here, in the session that owns it, which then delivers its notice.
+			runs = listAsyncRuns(asyncDirRoot, { states: ["queued", "running"], sessionId: state.currentSessionId, resultsDir, kill: options.kill, now: options.now, adoptCompletionOwnerId: state.completionOwnerId }, observeStatus);
 		} catch (error) {
 			console.error(`Failed to restore active async jobs from '${asyncDirRoot}':`, error);
 			return;

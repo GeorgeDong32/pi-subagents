@@ -1,5 +1,5 @@
-import { keyText, type Theme } from "@earendil-works/pi-coding-agent";
-import { Container, MouseRegion, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, keyText, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
+import { Box, Container, Markdown, MouseRegion, Spacer, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { SUBAGENT_CONTROL_MESSAGE_TYPE } from "../extension/control-notices.ts";
 import { SUBAGENT_STEERING_MESSAGE_TYPE } from "../extension/steering-notices.ts";
 import { parseSupervisorReplyData, parseSupervisorRequestDetails, SUPERVISOR_REPLY_ENTRY_TYPE, SUPERVISOR_REQUEST_MESSAGE_TYPE } from "../intercom/supervisor-ui.ts";
@@ -24,6 +24,19 @@ interface SubagentEntry {
 type Headline = ReadonlyArray<string | { status: string }>;
 
 type MessageKind = "ask" | "reply" | "result" | "attention" | "watchdog";
+
+/**
+ * Theme colors for the label. Pi's themes offer few non-status colors that read
+ * apart, so asks and attention notices, both a child needing the parent, share one,
+ * and replies, the parent's own words, take the quiet text color.
+ */
+const KIND_LABEL_COLORS = {
+	ask: "customMessageLabel",
+	attention: "customMessageLabel",
+	reply: "customMessageText",
+	result: "mdLink",
+	watchdog: "toolTitle",
+} as const satisfies Record<MessageKind, ThemeColor>;
 
 interface BlockView {
 	kind: MessageKind;
@@ -198,6 +211,7 @@ const MESSAGE_VIEWS = new Map<string, (message: SubagentMessage) => BlockView>([
 	["subagent-wait-subscription", readsContent("result", (message) => waitSubscriptionHeadline(message.details))],
 	["subagent-incremental-child-notify", readsContent("result", workflowChildHeadline)],
 	["subagent-workflow-result-write-failed", readsContent("result", () => ["workflow result ", { status: "save failed" }])],
+	["subagent-auto-resume", readsContent("result", () => ["workflow auto-resume ", { status: "failed" }])],
 	[SUBAGENT_CONTROL_MESSAGE_TYPE, readsContent("attention", (message) => controlNoticeHeadline(message.details))],
 	[SUBAGENT_STEERING_MESSAGE_TYPE, readsContent("attention", (message) => steeringNoticeHeadline(message.details))],
 	[SUBAGENT_WATCHDOG_WARNING_TYPE, (message) => watchdogWarningView(message.details, contentText(message.content))],
@@ -225,11 +239,11 @@ function headlineText(headline: Headline, theme: Theme): string {
 			plain += word;
 			continue;
 		}
-		if (plain) text += theme.fg("dim", safeTerminalText(plain));
+		if (plain) text += theme.fg("customMessageText", safeTerminalText(plain));
 		plain = "";
 		text += theme.fg(tone, word);
 	}
-	return plain ? text + theme.fg("dim", safeTerminalText(plain)) : text;
+	return plain ? text + theme.fg("customMessageText", safeTerminalText(plain)) : text;
 }
 
 /**
