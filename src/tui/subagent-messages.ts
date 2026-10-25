@@ -239,11 +239,11 @@ function headlineText(headline: Headline, theme: Theme): string {
 			plain += word;
 			continue;
 		}
-		if (plain) text += theme.fg("customMessageText", safeTerminalText(plain));
+		if (plain) text += theme.fg("dim", safeTerminalText(plain));
 		plain = "";
 		text += theme.fg(tone, word);
 	}
-	return plain ? text + theme.fg("customMessageText", safeTerminalText(plain)) : text;
+	return plain ? text + theme.fg("dim", safeTerminalText(plain)) : text;
 }
 
 /**

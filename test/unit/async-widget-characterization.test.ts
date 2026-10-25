@@ -91,7 +91,7 @@ describe("async widget characterization", () => {
 			], { collapsed: true });
 			const lines = component.render(80);
 			assert.equal(lines.length, 1);
-			assert.match(lines[0]!, /subagents \(1\/3 running, 1 queued, 1 failed\)/, `actual: ${lines[0]}`);
+			assert.match(lines[0]!, /subagents \(1\/3 running \d+s, 1 queued, 1 failed\)/, `actual: ${lines[0]}`); // upstream v0.82: elapsed suffix in the single-line summary
 			assert.equal(lines[0]!.length, 80, "single line padded to the render width");
 			assert.equal(lines[0]!.length <= 80, true);
 		} finally {
