@@ -316,16 +316,18 @@ describe("subagent extension child mode", () => {
 					content: [{ type: "text", text: "Agent configuration is invalid." }],
 					details: { mode: "management", results: [] },
 				}, { expanded: false, isPartial: false }, theme, { isError: true, state: {} }).render(120);
-				if (running.length !== 1 || running[0] !== "● delegate · running") throw new Error("unexpected running summary: " + JSON.stringify(running));
-				if (asyncSingle.length !== 1 || asyncSingle[0] !== "● single · running") throw new Error("unexpected async single summary: " + JSON.stringify(asyncSingle));
-				if (asyncChain.length !== 1 || asyncChain[0] !== "● chain · running") throw new Error("unexpected async chain summary: " + JSON.stringify(asyncChain));
-				if (completed.length !== 1 || completed[0] !== "✓ delegate · completed") throw new Error("unexpected completed summary: " + JSON.stringify(completed));
-				if (stopped.length !== 1 || stopped[0] !== "■ delegate · stopped") throw new Error("unexpected stopped summary: " + JSON.stringify(stopped));
-				if (paused.length !== 1 || paused[0] !== "■ delegate · paused") throw new Error("unexpected paused summary: " + JSON.stringify(paused));
-				if (failed.length !== 1 || failed[0] !== "✗ delegate · failed") throw new Error("unexpected failed summary: " + JSON.stringify(failed));
-				if (failedWithPaused.length !== 1 || failedWithPaused[0] !== "✗ parallel · failed") throw new Error("unexpected paused aggregate summary: " + JSON.stringify(failedWithPaused));
-				if (failedWithStopped.length !== 1 || failedWithStopped[0] !== "✗ parallel · failed") throw new Error("unexpected stopped aggregate summary: " + JSON.stringify(failedWithStopped));
-				if (contextError.length !== 1 || contextError[0] !== "✗ management · failed") throw new Error("unexpected context error summary: " + JSON.stringify(contextError));
+				// fork ⎿ family rows: every inline summary line carries the dim ⎿ gutter
+				// (f600aaae convention), with the status glyph starting the content.
+				if (running.length !== 1 || running[0] !== "  ⎿  delegate · running") throw new Error("unexpected running summary: " + JSON.stringify(running));
+				if (asyncSingle.length !== 1 || asyncSingle[0] !== "  ⎿  single · running") throw new Error("unexpected async single summary: " + JSON.stringify(asyncSingle));
+				if (asyncChain.length !== 1 || asyncChain[0] !== "  ⎿  chain · running") throw new Error("unexpected async chain summary: " + JSON.stringify(asyncChain));
+				if (completed.length !== 1 || completed[0] !== "  ⎿  ✓ delegate · completed") throw new Error("unexpected completed summary: " + JSON.stringify(completed));
+				if (stopped.length !== 1 || stopped[0] !== "  ⎿  ■ delegate · stopped") throw new Error("unexpected stopped summary: " + JSON.stringify(stopped));
+				if (paused.length !== 1 || paused[0] !== "  ⎿  ■ delegate · paused") throw new Error("unexpected paused summary: " + JSON.stringify(paused));
+				if (failed.length !== 1 || failed[0] !== "  ⎿  ✗ delegate · failed") throw new Error("unexpected failed summary: " + JSON.stringify(failed));
+				if (failedWithPaused.length !== 1 || failedWithPaused[0] !== "  ⎿  ✗ parallel · failed") throw new Error("unexpected paused aggregate summary: " + JSON.stringify(failedWithPaused));
+				if (failedWithStopped.length !== 1 || failedWithStopped[0] !== "  ⎿  ✗ parallel · failed") throw new Error("unexpected stopped aggregate summary: " + JSON.stringify(failedWithStopped));
+				if (contextError.length !== 1 || contextError[0] !== "  ⎿  ✗ management · failed") throw new Error("unexpected context error summary: " + JSON.stringify(contextError));
 			`;
 			const env = parentToolEnv();
 			env.PI_CODING_AGENT_DIR = agentDir;
@@ -547,7 +549,10 @@ describe("subagent extension child mode", () => {
 			}
 		};
 		const defaults = register({});
-		assert.ok(defaults.commands.includes("run") && defaults.commands.includes("subagents-watchdog") && defaults.commands.includes("prompt-workflow"));
+		// surface-tuning whitelist: prompt-workflow stays suppressed (status queries go
+		// through the subagent tool; "run" is the only launch entry point kept).
+		assert.ok(defaults.commands.includes("run") && defaults.commands.includes("subagents-watchdog"));
+		assert.deepEqual(defaults.commands, ["subagents-watchdog", "run", "subagent-cost", "subagents-detach", "subagents-stop", "subagents-steer"]);
 		assert.deepEqual(defaults.shortcuts, ["ctrl+alt+d"]);
 		const disabled = register({ enableSlashCommands: false });
 		assert.deepEqual(disabled.commands, []);
@@ -717,7 +722,11 @@ describe("subagent extension child mode", () => {
 				if (lines.length !== 1) throw new Error("configured collapsed widget must render one line: " + JSON.stringify(lines));
 				component.handleMouse({ type: "click", button: "left", y: 0, shift: false, alt: false, ctrl: false });
 				const unfolded = component.render(120);
-				if (unfolded.length !== 2 || !unfolded[0].includes("Async agents")) throw new Error("configured rows layout must render a header and one line for the run: " + JSON.stringify(unfolded));
+				// upstream fanout orchestration adds a per-run activity line; the fork seam
+				// projects it as the CC ⎿ family row (queued…/thinking…/tools · time).
+				// A single run shows its own title line; "Async agents" is the multi-run header.
+				if (unfolded.length !== 3 || !unfolded[0].includes("async subagent worker")) throw new Error("configured rows layout must render the run title, the run row and the activity row: " + JSON.stringify(unfolded));
+				if (!/⎿/.test(unfolded[2] ?? "") || !unfolded[2].includes("queued")) throw new Error("activity row must use the fork ⎿ convention: " + JSON.stringify(unfolded));
 				for (const handler of handlers.get("session_shutdown")) await handler();
 			`;
 			const env = parentToolEnv(agentDir);
@@ -1657,7 +1666,7 @@ describe("subagent extension child mode", () => {
 		assert.deepEqual(output.entryTypes, ["subagent_supervisor_reply", "subagent_watchdog_warning"]);
 		for (const [type, lines] of [...output.blocks.messages, ...output.blocks.entries]) {
 			assert.equal(lines.length, 1, type);
-			assert.match(lines[0]!, /^ \[subagent\] .+ \(click to expand\)$/, type);
+			assert.match(lines[0]!, /^  ⎿  .+ \(ctrl\+o to expand\)$/, type);
 		}
 	});
 
