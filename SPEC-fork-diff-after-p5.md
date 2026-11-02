@@ -38,6 +38,15 @@ native adapter（`drawNativeFleetFrame`）现按上游语义绘制：非交互�
 - 端到端（合并后代码）：bridge probe→注册 `cc-tui`→CC 展开形态渲染→`stop()` 撤回→原生折叠摘要行恢复。
 - 演练分支已删除（`drill/upstream-6826b054`，结果记录于此）。
 
+## P8 上游更新（2026-11-02）：v0.82.1 → post-v0.84.0（63 提交）
+
+- 区间：`35d45d98 → e9a31b3e`（v0.82.1 → v0.84.0 后未发布修复），merge commit `b2cee5fb` + 测试适配 `5c706090`；回滚点 tag `pre-p8-sync`。
+- 冲突：仅 2 文件（merge-tree 预演）。`CHANGELOG.md` 按 P7 先例取 fork 侧（上游版本流由本节记录承载）；`index-child-registration.test.ts` 取上游演进版后重新适配 fork surface。
+- 上游关键修复落地：**#3066 fresh children placed on a machine**（serializeHerdrPiLaunch 只拒已存在 transcript 的路径，不再无条件拒 file storage——修复 Rex/Herdr pane 放置对 fresh child 必炸的问题，即本仓本次同步的起因）；workflow script 进程隔离（#3104，security）；#3049/#3052/#3053 等修。
+- fork 定制零丢失核查（9/9）：label 通道（schemas/tool-description GUIDANCE）、checklist 措辞（迁至 `src/workflows/workflow-checklist.ts`）、slash 白名单（迁至 `src/slash/slash-commands.ts`，/run + subagents-* 抑制）、viewOnly details 抑制（extension/index.ts）、presentation seam（render.ts seamCompose/seamDraw 12 处，上游本轮仅改 render.ts 且自动合并成功）、⎿ chat 行、async surface frame（PresentationSurface "fleet"|"async"）、pi 1.3.0 chord alias 门控（runner-aliases.ts）、上游未触碰其余定制文件。
+- 测试适配（5c706090）：slash 白名单 pin 六命令集（prompt-workflow 保持抑制）；⎿ chat 行断言；async widget rows 展开三行形态（上游 fanout orchestration 活动 ⎿ 行 + 单 run 自有 title line）；summary inline 全状态 ⎿ gutter（f600aaae 约定，P7 测试欠账——顺带还上 2 个 P7 遗留稳定失败）。
+- 验证：tsc 绿；unit 4330/4350，稳定失败集 = pre-p8 基线完全一致（render-helpers×2 + host-peer×1，零新增）；npm-discovery 超时项单跑绿（并发时序 flaky）。
+
 ## P7 上游更新（2026-10-25）：v0.79.1 → v0.82.1（213 提交）
 
 - 区间：`95683a44 → 35d45d98`（v0.79.1 → v0.82.1），merge commit `786cdbb4` + 测试适配 `73103467`。
