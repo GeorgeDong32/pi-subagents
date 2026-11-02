@@ -124,7 +124,7 @@ Pi records each tool definition and prompt section a session declares, and decla
 { "disabledFeatures": ["watchdog", "panes", "preflight", "lane-metadata", "gates"] }
 ```
 
-Removes feature groups you do not use from the `subagent` tool. Each listed feature loses its top-level parameters from the model-facing schema and its `options` keys are rejected, and any request that still uses one of its parameters or actions fails with an error naming this setting. The check covers the parent tool, fanout-child tools, RPC, slash commands, prompt templates, scheduled launches, delegated launches, and workflow `runs.run`/`runs.all`/`runs.lanes` children, which are rejected before they launch. The built-in tool descriptions, the unknown-action list, the fanout-child tool description, and RPC `ping` no longer mention disabled features, and `{ action: "guide", options: { topic: "tool-reference" } }` starts with a notice listing what is disabled. Custom tool descriptions are not changed. Nothing is disabled by default, and the default schema and description are unchanged. An unknown or duplicate feature name fails config loading rather than silently re-enabling every feature.
+Removes feature groups you do not use from the `subagent` tool. Each listed feature loses its top-level parameters from the model-facing schema and its `options` keys are rejected, and any request that still uses one of its parameters or actions fails with an error naming this setting. The check covers the parent tool, fanout-child tools, RPC, slash commands, prompt templates, scheduled launches, delegated launches, and workflow `runs.run`/`runs.all`/`runs.lanes` children, which are rejected before they launch. The built-in tool descriptions, the unknown-action list, the fanout-child tool description, and RPC `ping` no longer mention disabled features. Every `{ action: "guide" }` response starts with a notice: a topic lists what is disabled, and a section points to the `tool-reference` topic for that list. With `workflow-scripts` disabled, the notice also says to use the top-level `tasks` or `chain` fields instead. Custom tool descriptions are not changed. Nothing is disabled by default, and the default schema and description are unchanged. An unknown or duplicate feature name fails config loading rather than silently re-enabling every feature.
 
 | Feature | Parameters removed | Actions rejected |
 |---|---|---|
@@ -202,7 +202,18 @@ With `"summary"`, a tool result looks like this:
 
 Set to `false` to register none of the pi-subagents slash commands (`/run`, `/subagents`, `/subagents-fleet`, `/subagents-watchdog`, `/prompt-workflow`, and the rest) and no [`foregroundDetachShortcut`](#foregrounddetachshortcut). The `subagent` tool, RPC, the async widget, and the extension's other features are unchanged. Prompt templates whose frontmatter has `chain:` launch through `/prompt-workflow`, so they stop working too. Defaults to `true`. Restart Pi or run `/reload` after changing it.
 
-The package's prompt shortcuts, such as `/parallel-review` and `/review-loop`, are Pi prompt templates, not commands, so this setting leaves them alone. Pi's package filter removes them: `{ "packages": [{ "source": "npm:pi-subagents", "prompts": [] }] }` in Pi's `settings.json`, or `pi config`.
+The package's prompt shortcuts, such as `/parallel-review` and `/review-loop`, are Pi prompt templates, not commands, so this setting leaves them alone. The same goes for its skills (`pi-subagents` and `council-mode`) and built-in agents. To turn them off, use Pi's package filter for prompts and skills and `disableBuiltins` for the agents, in Pi's `settings.json`. This turns off every prompt, the `council-mode` skill and every built-in agent:
+
+```json
+{
+  "packages": [
+    { "source": "npm:pi-subagents", "prompts": [], "skills": ["!council-mode"] }
+  ],
+  "subagents": { "disableBuiltins": true }
+}
+```
+
+A `!` entry such as `"!review-loop.md"` drops one file, and `[]` drops all of that type. `subagents.agentOverrides.<name>.disabled: true` turns off one built-in agent instead of all of them ([agents.md](agents.md)). `pi config` toggles the package's prompts and skills interactively.
 
 ## `foregroundDetachShortcut`
 

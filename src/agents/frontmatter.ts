@@ -108,7 +108,8 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 		// neither end a pending list block nor become part of its value.
 		if (trimmed.startsWith("#") && !currentFolded && !currentLiteral) continue;
 
-		if (currentKey !== null && currentBlockLines !== null && (indent > (currentIndent ?? 0) || ((currentFolded || currentLiteral) && trimmed === ""))) {
+		// Exactly-empty lines belong to any pending block, not only to | and > scalars.
+		if (currentKey !== null && currentBlockLines !== null && (indent > (currentIndent ?? 0) || trimmed === "")) {
 			// This line is part of the current block value
 			currentBlockLines.push(line);
 			continue;
@@ -116,15 +117,7 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 
 		// Flush any pending block value
 		if (currentKey !== null && currentBlockLines !== null) {
-			// Strip the common leading whitespace from the block so the
-			// serializer can add its own indentation level.
-			const rawBlock = currentBlockLines.join("\n");
-			const leadingSpaces = rawBlock.match(/^[ \t]+(?=\S)/m);
-			const prefix = leadingSpaces?.[0] ?? "";
-			const stripped = prefix
-				? rawBlock.replace(new RegExp(`^${escapeRegex(prefix)}`, "gm"), "").replace(/^\n/, "")
-				: rawBlock;
-			frontmatter[currentKey] = currentFolded ? foldBlock(stripped) : stripped;
+			frontmatter[currentKey] = flushBlockLines(currentBlockLines, currentFolded, currentLiteral);
 			currentKey = null;
 			currentBlockLines = null;
 			currentIndent = null;
@@ -158,19 +151,31 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 				frontmatter[key] = value;
 			}
 		}
-		// Lines that don't match a key pattern (e.g., comments, empty lines) are ignored
 	}
 
 	// Flush final block value
 	if (currentKey !== null && currentBlockLines !== null) {
-		const rawBlock = currentBlockLines.join("\n");
-		const leadingSpaces = rawBlock.match(/^[ \t]+(?=\S)/m);
-		const prefix = leadingSpaces?.[0] ?? "";
-		const stripped = prefix
-			? rawBlock.replace(new RegExp(`^${escapeRegex(prefix)}`, "gm"), "").replace(/^\n/, "")
-			: rawBlock;
-		frontmatter[currentKey] = currentFolded ? foldBlock(stripped) : stripped;
+		frontmatter[currentKey] = flushBlockLines(currentBlockLines, currentFolded, currentLiteral);
 	}
 
 	return { frontmatter, body };
+}
+
+function flushBlockLines(blockLines: string[], folded: boolean, literal: boolean): string {
+	let lines = blockLines;
+	if (!folded && !literal) {
+		// Drop exactly-empty edge lines, and every line from the first exactly-empty one after
+		// the last content line, so nested values without inner blank lines parse as before.
+		const end = lines.indexOf("", lines.findLastIndex((line) => line.trim() !== "") + 1);
+		lines = lines.slice(lines.findIndex((line) => line !== ""), end < 0 ? lines.length : end);
+	}
+	// Strip the common leading whitespace from the block so the
+	// serializer can add its own indentation level.
+	const rawBlock = lines.join("\n");
+	const leadingSpaces = rawBlock.match(/^[ \t]+(?=\S)/m);
+	const prefix = leadingSpaces?.[0] ?? "";
+	const stripped = prefix
+		? rawBlock.replace(new RegExp(`^${escapeRegex(prefix)}`, "gm"), "").replace(/^\n/, "")
+		: rawBlock;
+	return folded ? foldBlock(stripped) : stripped;
 }

@@ -842,8 +842,9 @@ export interface SteeringRecoveryDescriptor {
 	sessionFile?: string;
 	/** Git ref used to allocate managed worktrees for this run. */
 	baseRef?: string;
-	/** Launcher name the run was wrapped with; resume re-reads its argv from current user config. Absence means unwrapped. */
-	launcher?: string;
+	/** Launcher name the run was wrapped with, or null when it ran unwrapped; resume re-reads its argv from current user config.
+	 *  Absence (descriptors written before null was recorded) means unknown: resume uses the agent file's current launcher. */
+	launcher?: string | null;
 	cwd: string;
 	model?: string;
 	modelProvider?: string;
@@ -2016,7 +2017,7 @@ export interface AsyncStatus {
 		label?: string;
 		workflowKey?: string;
 		lane?: WorkflowLaneMetadata;
-		/** Display-only worktree path copied at launch; handoff remains authoritative. */
+		/** Worktree path copied at setup; the handoff stays authoritative for the cwd. */
 		worktreePath?: string;
 		/** Display-only branch copied at launch; handoff remains authoritative. */
 		branch?: string;
@@ -2361,7 +2362,7 @@ export interface ActiveAsyncCapacitySnapshot {
 export interface SubagentState {
 	baseCwd: string;
 	currentSessionId: string | null;
-	/** Exact SDK runtime session ID for supervisor ownership; never a session file path. */
+	/** Exact SDK runtime session ID (`getSessionId()`) for supervisor ownership and background-work matching; never a session file path. */
 	supervisorOwnerSessionId?: string | null;
 	/** Session for which active status projections were restored successfully. */
 	statusProjectionSessionId?: string | null;
@@ -2491,6 +2492,8 @@ export const SUBAGENT_CONTROL_EVENT = "subagent:control-event";
 export const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
 export const SUBAGENT_STEERING_NOTICE_EVENT = "subagent:steering-notice";
 export const SUBAGENT_CHILD_STATUS_EVENT = "subagent:child-status";
+/** Payload is only `{ version: 1 }`: a hint for hosts to read `status` again, not a description of the change. */
+export const SUBAGENT_JOBS_CHANGED_EVENT = "subagent:jobs-changed";
 export const SUBAGENT_RESULT_INTERCOM_EVENT = "subagent:result-intercom";
 export const SUBAGENT_RESULT_INTERCOM_DELIVERY_EVENT = "subagent:result-intercom-delivery";
 

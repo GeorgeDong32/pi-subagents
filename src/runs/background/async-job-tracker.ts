@@ -15,6 +15,7 @@ import {
 	SUBAGENT_CHILD_STATUS_EVENT,
 	SUBAGENT_CONTROL_EVENT,
 	SUBAGENT_CONTROL_INTERCOM_EVENT,
+	SUBAGENT_JOBS_CHANGED_EVENT,
 	SUBAGENT_STEERING_NOTICE_EVENT,
 	WIDGET_ANIMATION_INTERVAL_MS,
 } from "../../shared/types.ts";
@@ -33,6 +34,7 @@ import { readProcessTerminal } from "./process-terminal.ts";
 import { withCachedUiContext } from "../../shared/extension-context.ts";
 import { OWNING_SESSION_COMPLETION_OWNER } from "../../shared/completion-owner.ts";
 import type { ResultDeliveryOwnership } from "./result-delivery-ownership.ts";
+import { ownerSessionIds } from "../shared/run-ownership.ts";
 
 interface AsyncJobTrackerOptions {
 	completionRetentionMs?: number;
@@ -121,6 +123,7 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 	};
 	const rerenderWidget = (ctx: ExtensionContext, jobs = Array.from(state.asyncJobs.values())) => {
 		options.onJobsChanged?.();
+		pi.events.emit(SUBAGENT_JOBS_CHANGED_EVENT, { version: 1 });
 		if (state.widgetsSuspended) return;
 		renderWidget(ctx, options.widgetEnabled === false ? [] : jobs, options.widgetCollapsed, options.widgetLayout, options.seamDraw);
 		(ctx.ui as { requestRender?: () => void }).requestRender?.();
@@ -726,7 +729,18 @@ export function createAsyncJobTracker(pi: Pick<ExtensionAPI, "events">, state: S
 			if (now >= nextLivenessAt) {
 				nextLivenessAt = now + livenessIntervalMs;
 				let widgetChanged = false;
+				// A session reopened in this process takes its runs back from the session that replaced it.
+				const owners = state.currentSessionId ? ownerSessionIds(state.currentSessionId) : undefined;
 				for (const job of state.asyncJobs.values()) {
+					if (owners && job.sessionId !== undefined && !owners.has(job.sessionId)) {
+						cancelCleanup(job.asyncId);
+						closeJobWatcher(job.asyncId);
+						state.asyncJobs.delete(job.asyncId);
+						state.fleetJobs?.delete(job.asyncId);
+						options.onJobCleanup?.(job.asyncId);
+						widgetChanged = true;
+						continue;
+					}
 					watchJob(job);
 					if (refreshJob(job)) widgetChanged = true;
 				}

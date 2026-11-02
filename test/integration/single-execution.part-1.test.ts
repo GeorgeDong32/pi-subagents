@@ -1322,7 +1322,7 @@ Answer only from the supplied synthetic text.
 			assert.equal(fs.existsSync(marker), false);
 			assert.equal(mockPi.callCount(), 0);
 
-			const ceiling = registerSubagentCapabilityCeiling({ sessionId: ctx.sessionManager.getSessionFile()!, source: "test", ceiling: { allowedAgents: ["echo"] } });
+			const ceiling = registerSubagentCapabilityCeiling({ sessionId: ctx.sessionManager.getSessionId(), source: "test", ceiling: { allowedAgents: ["echo"] } });
 			try {
 				const denied = await executor.executePublic("ceiling-denied", { workflow: "test.mixed", async: false, capabilityCeiling: { version: 1, allowedAgents: ["reviewer"], sources: ["caller"] } }, new AbortController().signal, undefined, ctx);
 				assert.equal(denied.isError, true);
@@ -2402,7 +2402,8 @@ Answer only from the supplied synthetic text.
 			const { launch, stopWhenStage2Starts } = setup({ globalConcurrencyLimit: 1 });
 			mockPi.onCall({ matchArgIncludes: `Stage one ${nonce}`, hangUntilAbort: true });
 			const runId = await launch({ workflowScript: `await Promise.all([runs.run("stage1", { agent: "echo", task: "Stage one ${nonce}" }), runs.run("stage2", { agent: "echo", task: "Stage two ${nonce}" })]);` });
-			const stopped = await stopWhenStage2Starts(runId, new Error("Stopped by user."), (status) => status.steps?.find((step) => step.workflowKey === "stage1")?.async === false);
+			// IPC may deliver the parallel requests on separate turns. Stop only once stage2 is queued.
+			const stopped = await stopWhenStage2Starts(runId, new Error("Stopped by user."), (status) => stage2Started(status) && status.steps?.find((step) => step.workflowKey === "stage1")?.async === false);
 			assert.deepEqual(stopped.steps?.map(({ workflowKey, status, async }) => ({ workflowKey, status, async })), [
 				{ workflowKey: "stage1", status: "stopped", async: false },
 				{ workflowKey: "stage2", status: "stopped", async: false },

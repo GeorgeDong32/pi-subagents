@@ -337,6 +337,35 @@ body`);
 	});
 });
 
+describe("blank lines in nested frontmatter blocks", () => {
+	const fm = (body: string) => parseFrontmatter(`---\n${body}---\npayload`);
+
+	it("preserves a nested block value across exactly-empty lines", () => {
+		const parsed = fm("runner:\n  type: external-cli\n  command: python3\n  args:\n    - -c\n    - |\n      import hashlib\n\n      x = 1\n      print('ok')\nname: t\n");
+		assert.equal(parsed.frontmatter.runner, "type: external-cli\ncommand: python3\nargs:\n  - -c\n  - |\n    import hashlib\n\n    x = 1\n    print('ok')");
+		assert.equal(parsed.frontmatter.name, "t");
+	});
+
+	it("keeps list items after an exactly-empty line and drops no comment into the list", () => {
+		const parsed = fm("tools:\n  - read\n\n# note\n\n  - bash\nname: x\n");
+		assert.deepEqual(parseFrontmatterList(parsed.frontmatter.tools), ["read", "bash"]);
+		assert.equal(parsed.frontmatter.name, "x");
+	});
+
+	it("keeps edge blank lines out of nested block values", () => {
+		assert.equal(fm("runner:\n  type: x\n\nname: z\n").frontmatter.runner, "type: x");
+		assert.equal(fm("runner:\n  type: x\n\n").frontmatter.runner, "type: x");
+		assert.equal(fm("runner:\n\n\n  type: x\n").frontmatter.runner, "type: x");
+		assert.equal(fm("runner:\n  type: x\n  \nname: z\n").frontmatter.runner, "type: x\n");
+		assert.equal(fm("async:\n  true\n\n  \nname: x\n").frontmatter.async, "true");
+	});
+
+	it("leaves literal and folded block edges unchanged", () => {
+		assert.equal(fm("prompt: |\n  hello\n\nname: x\n").frontmatter.prompt, "hello\n");
+		assert.equal(fm("description: >\n  normal\n\n  next\nname: x\n").frontmatter.description, "normal\nnext");
+	});
+});
+
 describe("agent runner frontmatter", () => {
 	it("parses and serializes an external-cli runner", () => withTempHome(() => {
 		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-runner-agent-"));

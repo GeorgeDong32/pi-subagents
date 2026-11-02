@@ -25,7 +25,7 @@ import { buildDoctorReport } from "../../extension/doctor.ts";
 import { readSubagentGuide } from "../../extension/subagent-guide.ts";
 import { isWorkflowScriptPath, normalizePublicSubagentExecution, validateWorkflowCapacityOverrides } from "../../extension/public-execution.ts";
 import { readReplyWorkflowScript } from "../../extension/reply-workflow-script.ts";
-import { disabledFeatureNotice, disabledFeatureUseError, resolveDisabledFeatureSurface, type DisabledFeatureSurface } from "../../shared/disabled-features.ts";
+import { disabledFeatureNotice, disabledFeatureSectionNotice, disabledFeatureUseError, resolveDisabledFeatureSurface, type DisabledFeatureSurface } from "../../shared/disabled-features.ts";
 import { runSync } from "./execution.ts";
 import { commandAction } from "./command-action.ts";
 import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/tool-actions.ts";
@@ -118,7 +118,7 @@ import { formatHerdrMachineRunnerUnsupported, resolveMachinePlacement } from "..
 import { lookupRunnerLauncher, resolveAgentRunnerLauncher } from "../shared/runner-launcher.ts";
 import { applyForceTopLevelAsyncOverride } from "../background/top-level-async.ts";
 import { handleMissionAction, MISSION_ACTIONS } from "../../missions/actions.ts";
-import { attachMissionToLaunchResult, prepareMissionLaunch, writeMissionAsyncBinding, type MissionLaunchBinding } from "../../missions/lifecycle.ts";
+import { attachMissionToLaunchResult, missionAcceptanceStatus, prepareMissionLaunch, writeMissionAsyncBinding, type MissionLaunchBinding } from "../../missions/lifecycle.ts";
 import { MissionNotFoundError, updateMission } from "../../missions/store.ts";
 import type { MissionWorkflowChildUpdate } from "../../missions/types.ts";
 import { createMissionWorkflowState } from "../../missions/workflow-state.ts";
@@ -1042,10 +1042,6 @@ type NestedResumeSourceTarget = {
 };
 type ResumeSourceTarget = AsyncResumeSourceTarget | ForegroundResumeSourceTarget | NestedResumeSourceTarget;
 
-function isAsyncRunNotFound(error: unknown): boolean {
-	return error instanceof Error && error.message.startsWith("Async run not found.");
-}
-
 function isMissingExactAsyncStatusFile(error: unknown, requested: string): boolean {
 	return error instanceof Error && error.message === `Status file not found for async run '${requested}'.`;
 }
@@ -1112,37 +1108,9 @@ function resolveResumeTarget(params: SubagentParamsLike, state: SubagentState, o
 		if (isResumeAmbiguity(foregroundError) && !resumeTargetExact(asyncTarget, requested)) throw foregroundError;
 		return asyncTarget;
 	}
-	if (foregroundError && !isAsyncRunNotFound(asyncError)) throw foregroundError;
 	if (foregroundError) throw foregroundError;
 	if (asyncError) throw asyncError;
 	throw new Error("Run not found. Provide id or runId.");
-}
-
-function getAsyncInterruptTarget(
-	state: SubagentState,
-	runId: string | undefined,
-	location?: { asyncDir: string | null; resolvedId?: string },
-	options: { fallbackToNewest?: boolean } = {},
-): { asyncId: string; asyncDir: string } | undefined {
-	if (location?.asyncDir) {
-		return {
-			asyncId: location.resolvedId ?? runId ?? path.basename(location.asyncDir),
-			asyncDir: location.asyncDir,
-		};
-	}
-	if (runId) {
-		const direct = state.asyncJobs.get(runId);
-		if (direct) return { asyncId: direct.asyncId, asyncDir: direct.asyncDir };
-		if (options.fallbackToNewest === false) return undefined;
-	}
-	let newest: { asyncId: string; asyncDir: string; updatedAt: number } | undefined;
-	for (const job of state.asyncJobs.values()) {
-		if (job.status !== "running") continue;
-		if (!newest || (job.updatedAt ?? 0) > newest.updatedAt) {
-			newest = { asyncId: job.asyncId, asyncDir: job.asyncDir, updatedAt: job.updatedAt ?? 0 };
-		}
-	}
-	return newest ? { asyncId: newest.asyncId, asyncDir: newest.asyncDir } : undefined;
 }
 
 function isStaleExtensionContextError(error: unknown): boolean {
@@ -1226,16 +1194,16 @@ function emitControlNotification(input: {
 
 function interruptAsyncRun(
 	state: SubagentState,
-	runId: string | undefined,
+	runId: string,
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean,
 	location?: { asyncDir: string | null; resolvedId?: string },
 ): AgentToolResult<Details> | null {
-	const target = getAsyncInterruptTarget(state, runId, location, { fallbackToNewest: runId === undefined });
+	const target = location?.asyncDir ? { asyncId: location.resolvedId ?? runId, asyncDir: location.asyncDir } : state.asyncJobs.get(runId);
 	if (!target) return null;
 	const status = reconcileAsyncRun(target.asyncDir, omitUndefinedProperties({ kill })).status;
 	if (!status || status.state !== "running" || typeof status.pid !== "number") {
 		return {
-			content: [{ type: "text", text: `No running async run with an interrupt-capable pid was found for '${runId ?? "current"}'.` }],
+			content: [{ type: "text", text: `No running async run with an interrupt-capable pid was found for '${runId}'.` }],
 			isError: true,
 			details: { mode: "management", results: [] },
 		};
@@ -1427,6 +1395,7 @@ function appendStepToAsyncChain(input: {
 		parentSessionId: input.ctx.sessionManager.getSessionId() ?? undefined,
 		parentSessionFile: input.ctx.sessionManager.getSessionFile() ?? undefined,
 		currentModelProvider: parentModel?.provider,
+		parentProviderRegistry: input.ctx.modelRegistry,
 		currentModel: parentModel,
 		scopedModelIds: scopedModelIdsFromContext(input.ctx),
 		modelScope: discoveredForAppend.modelScope,
@@ -1466,7 +1435,7 @@ function appendStepToAsyncChain(input: {
 		worktreeBranchPrefix: input.deps.config.worktreeBranchPrefix,
 		asyncDir: resolved.location.asyncDir,
 		validateOutputBindings: false,
-		capabilityCeiling: intersectSubagentCapabilityCeilings(status.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(asyncCtx.currentSessionId)),
+		capabilityCeiling: intersectSubagentCapabilityCeilings(status.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(asyncCtx.parentSessionId)),
 		requiredExtensions: retainedRequiredExtensions,
 	}));
 	if ("error" in built) {
@@ -1895,6 +1864,7 @@ async function resumeExternalJobFollowUp(input: {
 			parentSessionId: input.ctx.sessionManager.getSessionId() ?? undefined,
 			parentSessionFile: input.ctx.sessionManager.getSessionFile() ?? undefined,
 			currentModelProvider: parentModel?.provider,
+			parentProviderRegistry: input.ctx.modelRegistry,
 			currentModel: parentModel,
 			scopedModelIds: scopedModelIdsFromContext(input.ctx),
 			modelScope: input.modelScope,
@@ -1923,7 +1893,7 @@ async function resumeExternalJobFollowUp(input: {
 		availableModels: input.ctx.modelRegistry.getAvailable().map(toModelInfo),
 		outputBaseDir: resolveSingleRunOutputBaseDir(input.deps, artifactsDir, runId),
 		...(input.absoluteDeadlineAt !== undefined ? { absoluteDeadlineAt: input.absoluteDeadlineAt } : {}),
-		capabilityCeiling: resolveCurrentSubagentCapabilityCeiling(currentSessionId),
+		capabilityCeiling: resolveCurrentSubagentCapabilityCeiling(input.ctx.sessionManager.getSessionId() ?? undefined),
 		runFanoutBudget: createRunFanoutBudget(runId, resolveMaxSubagentSpawnsPerRun(input.deps.config.maxSubagentSpawnsPerRun)),
 		activeAsyncCapacity,
 		externalJobFollowUp: { sourceRunId: input.target.runId, sourceStepIndex: input.target.index, parentProviderJobId: externalJob.providerJobId, requestId, requestDigest },
@@ -2186,6 +2156,7 @@ async function resumeAsyncRun(input: {
 				parentSessionId: input.ctx.sessionManager.getSessionId() ?? undefined,
 				parentSessionFile: input.ctx.sessionManager.getSessionFile() ?? undefined,
 				currentModelProvider: parentModel?.provider,
+				parentProviderRegistry: input.ctx.modelRegistry,
 				currentModel: parentModel,
 				scopedModelIds: scopedModelIdsFromContext(input.ctx),
 				modelScope,
@@ -2222,7 +2193,7 @@ async function resumeAsyncRun(input: {
 			childIntercomTarget: intercomBridge.active ? (agent, index) => resolveSubagentIntercomTarget(runId, agent, index) : undefined,
 			globalConcurrencyLimit: input.deps.config.globalConcurrencyLimit,
 			runFanoutBudget: createRunFanoutBudget(runId, resolveMaxSubagentSpawnsPerRun(input.deps.config.maxSubagentSpawnsPerRun)),
-			capabilityCeiling: intersectSubagentCapabilityCeilings("capabilityCeiling" in target ? target.capabilityCeiling : undefined, resolveCurrentSubagentCapabilityCeiling(input.deps.state.currentSessionId)),
+			capabilityCeiling: intersectSubagentCapabilityCeilings("capabilityCeiling" in target ? target.capabilityCeiling : undefined, resolveCurrentSubagentCapabilityCeiling(input.ctx.sessionManager.getSessionId() ?? undefined)),
 			thinkingCeiling: target.thinkingCeiling,
 			activeAsyncCapacity,
 		}));
@@ -2255,8 +2226,8 @@ async function resumeAsyncRun(input: {
 	if (target.source === "nested" && !target.recoveryDescriptor) {
 		return { content: [{ type: "text", text: `Nested child '${target.runId}' is missing its required recovery identity. Start a new run instead.` }], isError: true, details: { mode: "management", results: [] } };
 	}
-	// Runs without a recovery descriptor were never wrapped; a launcher added to the agent file later does not apply.
-	const recoveryAgentConfig = recoveryDescriptor ? applySteeringRecoveryAgentConfig(baseAgentConfig, recoveryDescriptor) : { ...baseAgentConfig, launcher: undefined };
+	// Without a recovery descriptor nothing records how the run was wrapped, so the agent file's launcher applies.
+	const recoveryAgentConfig = recoveryDescriptor ? applySteeringRecoveryAgentConfig(baseAgentConfig, recoveryDescriptor) : baseAgentConfig;
 	const agentConfig = intercomBridge.active ? applyIntercomBridgeToAgent(recoveryAgentConfig, intercomBridge) : recoveryAgentConfig;
 	const foregroundContract = target.source === "foreground" ? target.resumeContract : undefined;
 	const outputSchema = Object.hasOwn(input.params, "outputSchema")
@@ -2275,7 +2246,7 @@ async function resumeAsyncRun(input: {
 	}
 	// Refuse before capacity moves so the retained run stays resumable once the config is fixed.
 	if (agentConfig.launcher !== undefined && !lookupRunnerLauncher(input.deps.config.runnerLaunchers, agentConfig.launcher)) {
-		return { content: [{ type: "text", text: `Cannot resume: run '${target.runId}' was launched with launcher '${agentConfig.launcher}', which is no longer defined in runnerLaunchers in the user subagent config.` }], isError: true, details: { mode: "management", results: [] } };
+		return { content: [{ type: "text", text: `Cannot resume: run '${target.runId}' uses launcher '${agentConfig.launcher}', which is no longer defined in runnerLaunchers in the user subagent config.` }], isError: true, details: { mode: "management", results: [] } };
 	}
 	const runId = randomUUID();
 	const topLevelResume = depth === 0 && !inheritedNestedRoute(input.deps) && !input.params.workflowParentRunId;
@@ -2326,6 +2297,7 @@ async function resumeAsyncRun(input: {
 			parentSessionId: input.ctx.sessionManager.getSessionId() ?? undefined,
 			parentSessionFile: input.ctx.sessionManager.getSessionFile() ?? undefined,
 			currentModelProvider: parentModel?.provider,
+			parentProviderRegistry: input.ctx.modelRegistry,
 			currentModel: parentModel,
 			scopedModelIds: scopedModelIdsFromContext(input.ctx),
 			modelScope,
@@ -2391,7 +2363,7 @@ async function resumeAsyncRun(input: {
 		...(input.params.toolBudget !== undefined ? { toolBudget: input.params.toolBudget } : {}),
 		// Recovery descriptors, remembered foreground runs, and current workflow roots
 		// preserve parent authority before the selected agent's descendant ceiling.
-		capabilityCeiling: intersectSubagentCapabilityCeilings(recoveryDescriptor?.capabilityCeiling ?? (target.source === "foreground" || (target.source === "async" && target.mode === "workflow") ? target.capabilityCeiling : undefined), resolveCurrentSubagentCapabilityCeiling(input.deps.state.currentSessionId)),
+		capabilityCeiling: intersectSubagentCapabilityCeilings(recoveryDescriptor?.capabilityCeiling ?? (target.source === "foreground" || (target.source === "async" && target.mode === "workflow") ? target.capabilityCeiling : undefined), resolveCurrentSubagentCapabilityCeiling(input.ctx.sessionManager.getSessionId() ?? undefined)),
 		runFanoutBudget: input.params.runFanoutBudget ?? recoveryDescriptor?.runFanoutBudget ?? createRunFanoutBudget(runId, resolveMaxSubagentSpawnsPerRun(input.deps.config.maxSubagentSpawnsPerRun)),
 		parentWorkflowRunId: input.params.workflowParentRunId,
 		workflowKey: input.params.workflowKey,
@@ -3613,6 +3585,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		parentSessionId: data.parentPiSessionId,
 		parentSessionFile: ctx.sessionManager.getSessionFile() ?? undefined,
 		currentModelProvider: parentModel?.provider,
+		parentProviderRegistry: ctx.modelRegistry,
 		currentModel: parentModel,
 		scopedModelIds: data.scopedModelIds,
 		modelScope: data.modelScope,
@@ -4296,7 +4269,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		? `[Read from: ${readPaths.join(", ")}]\n\n`
 		: "";
 	task = readsInstruction + task;
-	task = injectSingleOutputInstruction(task, outputPath, agentConfig);
+	task = injectSingleOutputInstruction(task, outputPath, agentConfig, foregroundMachine);
 
 	let effectiveSkills: string[] | undefined;
 	if (skillOverride === false) {
@@ -5733,7 +5706,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const eventsPath = path.join(asyncDir, "events.jsonl");
 				const startedAt = Date.now();
 				const currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
-				const workflowCapabilityCeiling = intersectSubagentCapabilityCeilings(requestParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(currentSessionId));
+				const workflowCapabilityCeiling = intersectSubagentCapabilityCeilings(requestParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(ctx.sessionManager.getSessionId() ?? undefined));
 				const completionOwnerId = deps.state.completionOwnerId ?? currentCompletionOwnerId();
 				deps.state.completionOwnerId = completionOwnerId;
 				const workflowScriptSourceDigest = workflowScriptDigest(requestParams.workflowScript);
@@ -6528,6 +6501,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 									...(result.details.results[0]?.sessionFile ? { sessionPath: result.details.results[0].sessionFile } : {}),
 									artifactPaths: child.artifactPaths,
 									...(["completed", "failed"].includes(childStatus) ? { completedAt: new Date().toISOString() } : {}),
+									acceptanceStatus: missionAcceptanceStatus(result.details.results),
 									heartbeat: { status: childStatus, ...(childPhase ? { phase: childPhase } : {}) },
 								});
 								if (result.details.asyncId) {
@@ -6678,7 +6652,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			let lastProgressAt = 0;
 			let workflowProgressClosed = false;
 			const workflowDeadlineAt = timeout === undefined ? undefined : Date.now() + timeout;
-			const workflowCapabilityCeiling = intersectSubagentCapabilityCeilings(requestParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(resolveCurrentSessionId(ctx.sessionManager)));
+			const workflowCapabilityCeiling = intersectSubagentCapabilityCeilings(requestParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(ctx.sessionManager.getSessionId() ?? undefined));
 			const sendWorkflowProgress = () => {
 				if (workflowProgressClosed) return;
 				if (activityTimer) clearTimeout(activityTimer);
@@ -6814,6 +6788,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 							...(result.details.results[0]?.sessionFile ? { sessionPath: result.details.results[0].sessionFile } : {}),
 							artifactPaths: child.artifactPaths,
 							...(["completed", "failed"].includes(childStatus) ? { completedAt: new Date().toISOString() } : {}),
+							acceptanceStatus: missionAcceptanceStatus(result.details.results),
 							heartbeat: { status: childStatus, ...(childPhase ? { phase: childPhase } : {}) },
 						});
 						return child;
@@ -7187,10 +7162,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (action === "guide") {
 				try {
 					const guide = readSubagentGuide(paramsWithResolvedCwd.topic);
-					const [topic, section] = paramsWithResolvedCwd.topic?.split("/") ?? [];
-					const fullNotice = topic === "tool-reference" ? disabledFeatureNotice(disabledFeatures) : undefined;
-					// Sections are capped at 8,000 chars, so they get a one-line pointer instead of the full list.
-					const notice = fullNotice && section !== undefined ? "Some options and actions documented here are disabled by config in this session; guide topic tool-reference lists them." : fullNotice;
+					const notice = paramsWithResolvedCwd.topic?.includes("/") ? disabledFeatureSectionNotice(disabledFeatures) : disabledFeatureNotice(disabledFeatures);
 					return {
 						content: [{ type: "text", text: notice ? `${notice}\n\n${guide}` : guide }],
 						details: { mode: "management", results: [] },
@@ -7535,21 +7507,20 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				);
 				if (stopResult) return stopResult;
 				return {
-					content: [{ type: "text", text: "No stoppable async run found in this session." }],
+					content: [{ type: "text", text: `No stoppable async run found for '${targetRunId}'.` }],
 					isError: true,
 					details: { mode: "management", results: [] },
 				};
 			}
 			if (action === "interrupt") {
 				const targetRunId = paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id;
+				if (!targetRunId) return { content: [{ type: "text", text: "action='interrupt' requires id." }], isError: true, details: { mode: "management", results: [] } };
 				let resolved: ResolvedSubagentRunId | undefined;
-				if (targetRunId) {
-					try {
-						resolved = resolveSubagentRunId(targetRunId, omitUndefinedProperties({ state: deps.state, nested: nestedResolutionScopeForExecutor(deps) }));
-					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
-						return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
-					}
+				try {
+					resolved = resolveSubagentRunId(targetRunId, omitUndefinedProperties({ state: deps.state, nested: nestedResolutionScopeForExecutor(deps) }));
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
 				}
 				if (resolved?.kind === "nested") return interruptNestedRun(resolved);
 				const foreground = getForegroundControl(deps.state, resolved?.kind === "foreground" ? resolved.id : targetRunId);
@@ -7577,7 +7548,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				);
 				if (asyncInterruptResult) return asyncInterruptResult;
 				return {
-					content: [{ type: "text", text: "No interrupt-capable run found in this session." }],
+					content: [{ type: "text", text: `No interrupt-capable run found for '${targetRunId}'.` }],
 					isError: true,
 					details: { mode: "management", results: [] },
 				};
@@ -7593,7 +7564,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				...ctx,
 				cwd: requestCwd,
 				config: deps.config,
-				currentSessionId: deps.state.currentSessionId ?? ctx.sessionManager.getSessionId() ?? undefined,
+				piSessionId: ctx.sessionManager.getSessionId() ?? undefined,
 				discoverAgentsAll: deps.discoverAgentsAll,
 				runtimeAgentOwner: deps.pi,
 				onAgentsChanged: deps.onAgentsChanged,
@@ -7719,7 +7690,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		// Check before pruner/session preparation, then recheck immediately before each fork
 		// because the session capability ceiling can tighten while preparation awaits.
 		const launchCapabilityCeiling = () => intersectSubagentCapabilityCeilings(
-			intersectSubagentCapabilityCeilings(effectiveParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(requestSessionId)),
+			intersectSubagentCapabilityCeilings(effectiveParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(requestPiSessionId)),
 			deps.childRuntime?.capabilityCeiling,
 		);
 		const assertLaunchableAgentsAllowedBeforeFork = (): void => {
@@ -8010,7 +7981,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			scopedModelIds: scopedModelIdsFromContext(ctx),
 			parentSessionId: requestSessionId,
 			parentPiSessionId: requestPiSessionId,
-			capabilityCeiling: intersectSubagentCapabilityCeilings(effectiveParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(requestSessionId)),
+			capabilityCeiling: intersectSubagentCapabilityCeilings(effectiveParams.capabilityCeiling, resolveCurrentSubagentCapabilityCeiling(requestPiSessionId)),
 			runFanoutBudget,
 			topLevelAsyncCapacityEligible,
 			activeAsyncCapacity,

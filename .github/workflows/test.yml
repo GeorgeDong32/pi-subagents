@@ -12,6 +12,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
+# Every job here reads the checkout and nothing else: no repository write, comment or release.
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test (${{ matrix.label }})
@@ -163,7 +167,7 @@ jobs:
       - name: WorkflowScript Bun parity tests
         run: >-
           bun test test/unit/scripted-workflow.test.ts
-          --test-name-pattern "portable workflow parity|regex literals|template expressions|portable plain helper|nested plain helper|unawaited child launch|unawaited runs.all|directly returned runs.run|docs-style awaited|awaited native Promise|Promise.resolve|Promise.all|then chain|new Promise wrapper"
+          --test-name-pattern "portable workflow parity|regex literals|template expressions|portable plain helper|nested plain helper|unawaited child launch|unawaited runs.all|directly returned runs.run|docs-style awaited|awaited native Promise|Promise.resolve|Promise.all|then chain|new Promise wrapper|string compilation|worker-realm value|rejects import|redefined locked global|stack-limit errors|built-in constructors"
 
   runner-loader-capability:
     strategy:

@@ -28,7 +28,7 @@ import {
 	buildProactiveSkillSubagentRecommendationLines,
 } from "./proactive-skills.ts";
 import { parseFrontmatter, parseUnquotedList } from "./frontmatter.ts";
-import { resolveEffectiveThinking, toModelInfo } from "../shared/model-info.ts";
+import { resolveEffectiveThinking, THINKING_LEVELS, toModelInfo } from "../shared/model-info.ts";
 import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-resolution.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import { formatReviewGateLabel, validateAcceptanceInput } from "../runs/shared/acceptance.ts";
@@ -43,7 +43,7 @@ import { listExternalJobProviders } from "../api/external-job-provider.ts";
 
 type ManagementAction = "list" | "get" | "models" | "create" | "update" | "delete" | "eject" | "disable" | "enable" | "reset";
 type ManagementScope = "user" | "project";
-type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; currentSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void; discoverAgentsAll?: typeof discoverAgentsAll };
+type ManagementContext = Pick<ExtensionContext, "cwd" | "modelRegistry"> & { model?: ExtensionContext["model"]; config?: ExtensionConfig; piSessionId?: string; runtimeAgentOwner?: RuntimeAgentOwner; onAgentsChanged?: () => void; discoverAgentsAll?: typeof discoverAgentsAll };
 
 function discoverCatalog(ctx: ManagementContext, cwd: string = ctx.cwd, provider?: string): AgentDiscoveryAllResult {
 	return (ctx.discoverAgentsAll ?? discoverAgentsAll)(cwd, provider);
@@ -361,10 +361,7 @@ export function preservedAgentFrontmatterFields(agent: AgentConfig, cfg: Record<
 	if (hasKey(cfg, "extensions")) changed("extensions");
 	if (hasKey(cfg, "subagentOnlyExtensions")) changed("subagentOnlyExtensions");
 	if (hasKey(cfg, "mutationTools")) changed("mutationTools");
-	if (hasKey(cfg, "thinking")) {
-		changed("thinking");
-		if (cfg.thinking === "off") fields.add("thinking");
-	}
+	if (hasKey(cfg, "thinking")) changed("thinking");
 	if (hasKey(cfg, "systemPromptMode")) {
 		changed("systemPromptMode");
 		fields.add("systemPromptMode");
@@ -528,12 +525,11 @@ function applyAgentConfig(target: AgentConfig, cfg: Record<string, unknown>): st
 		else return "config.mutationTools must be a comma-separated string, empty string, or false when provided.";
 	}
 	if (hasKey(cfg, "thinking")) {
-		if (cfg.thinking === false || cfg.thinking === "") delete target.thinking;
-		else if (typeof cfg.thinking === "string") {
-			const thinking = cfg.thinking.trim();
-			if (thinking) target.thinking = thinking;
-			else delete target.thinking;
-		} else return "config.thinking must be a string or false when provided.";
+		const thinking = typeof cfg.thinking === "string" ? cfg.thinking.trim() : cfg.thinking;
+		const level = THINKING_LEVELS.find((candidate) => candidate === thinking);
+		if (thinking === false || thinking === "") delete target.thinking;
+		else if (level) target.thinking = level;
+		else return `config.thinking must be one of ${THINKING_LEVELS.join(", ")}, or false when provided.`;
 	}
 	if (hasKey(cfg, "systemPromptMode")) {
 		if (cfg.systemPromptMode === "append" || cfg.systemPromptMode === "replace") target.systemPromptMode = cfg.systemPromptMode;
@@ -979,7 +975,7 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	let scopedAgents = effectiveAgentsForScope(scope, d, ctx.runtimeAgentOwner, ctx.model?.provider);
 	scopedAgents = scopedAgents
 		.sort((a, b) => a.name.localeCompare(b.name));
-	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
+	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.piSessionId);
 	const visibleAgents = scopedAgents.filter((a) => !a.disabled);
 	const agents = visibleAgents.filter((a) => isAgentAllowedByCapabilityCeiling(a.name, capabilityCeiling));
 	const restrictedAgents = visibleAgents.filter((a) => !isAgentAllowedByCapabilityCeiling(a.name, capabilityCeiling));
@@ -1014,9 +1010,16 @@ export function handleList(params: ManagementParams, ctx: ManagementContext): Ag
 	}));
 }
 
+// User then project overrides are layered, so the override's top-level scope can name a file that did not set `model`.
+function modelOverrideFile(override: NonNullable<AgentConfig["override"]>): { scope: "user" | "project"; path: string } {
+	const scopes = override.fieldScopes?.model;
+	const scope = scopes?.includes("project") ? "project" : scopes?.includes("user") ? "user" : override.scope;
+	return { scope, path: override.paths?.[scope] ?? override.path };
+}
+
 function formatModelSource(agent: AgentConfig, currentModel: ParentModel | undefined): string {
 	if (agent.override && agent.model !== agent.override.base.model) {
-		return `${agent.override.scope} override`;
+		return `${modelOverrideFile(agent.override).scope} override`;
 	}
 	if (agent.modelSource?.type === "subagents.defaultModel" && agent.model === agent.modelSource.model) {
 		return `${agent.modelSource.scope} defaultModel`;
@@ -1037,7 +1040,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 	const preferredProvider = ctx.model?.provider;
-	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
+	const capabilityCeiling = resolveCurrentSubagentCapabilityCeiling(ctx.piSessionId);
 
 	let selectedAgents = effectiveAgents;
 	if (requestedAgent) {
@@ -1081,7 +1084,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 			lines.push(`Thinking: ${effectiveThinking ?? "default"}`);
 			if (agent.override) {
 				lines.push("Override file:");
-				lines.push(`  ${agent.override.path}`);
+				lines.push(`  ${modelOverrideFile(agent.override).path}`);
 			}
 			if (agent.model && resolvedModel && agent.model !== resolvedModel) {
 				lines.push("Requested model setting:");
@@ -1100,7 +1103,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 		lines.push(`  thinking: ${effectiveThinking ?? "default"}`);
 		if (agent.override) {
 			lines.push("  override file:");
-			lines.push(`    ${agent.override.path}`);
+			lines.push(`    ${modelOverrideFile(agent.override).path}`);
 		}
 		if (agent.model && resolvedModel && agent.model !== resolvedModel) {
 			lines.push("  requested model setting:");

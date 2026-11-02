@@ -20,6 +20,11 @@ import { buildRunnerChildLaunch } from "../../src/runs/background/runner-child-l
 import { runChildSession } from "../../src/runs/background/run-child-session.ts";
 import { getAgentDir } from "../../src/shared/utils.ts";
 import registerHerdrPiBridge, { resolveRemoteHerdrResources } from "../../src/extension/herdr-pi-bridge.ts";
+import { executeAsyncSingle } from "../../src/runs/background/async-execution.ts";
+import { runSingleStepInner } from "../../src/runs/background/subagent-runner.ts";
+import { runSync } from "../../src/runs/foreground/execution.ts";
+import { DIRS } from "../../src/shared/types.ts";
+import { makeAgent } from "../support/helpers.ts";
 
 const machine = { provider: "herdr" as const, id: "m1", label: "workmac", target: "remote.example", cwd: "/remote/repo" };
 const runtime = { runId: "run", agent: "worker", childIndex: 0, fanoutChild: false, depth: 1, maxDepth: 1, inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: false, fast: false, waitTool: { enabled: true } };
@@ -63,7 +68,7 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 		assert.equal(seen?.cwd, "/remote/repo");
 	});
 
-	it("rejects unrepresented required and MCP tool contracts at the public factory boundary before provisioning", async () => { let provisioned = 0; const factory = createPlacementAwareChildSessionFactory({ async create() { return child; }, async dispose() {} }, async () => { provisioned++; return child; }); await assert.rejects(factory.create({ ...launch(true), runtime: { ...runtime, requiredTools: ["required_missing"] } }), /required-tool/u); await assert.rejects(factory.create({ ...launch(true), runtime: { ...runtime, mcpDirectTools: ["mcp_tool"] } }), /MCP direct tools/u); assert.equal(provisioned, 0); });
+	it("rejects MCP tool contracts at the public factory boundary before provisioning, and leaves required tools to the remote acknowledgement", async () => { let provisioned = 0; const factory = createPlacementAwareChildSessionFactory({ async create() { return child; }, async dispose() {} }, async () => { provisioned++; return child; }); await assert.rejects(factory.create({ ...launch(true), runtime: { ...runtime, mcpDirectTools: ["mcp_tool"] } }), /MCP direct tools/u); assert.equal(provisioned, 0); await factory.create({ ...launch(true), runtime: { ...runtime, requiredTools: ["read"] } }); assert.equal(provisioned, 1); });
 
 	it("propagates resolved placement into the detached native child launch", () => {
 		const built = buildRunnerChildLaunch({ agent: "worker", task: "inspect", machine, cwd: machine.cwd, tools: ["read"], inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: false }, { cwd: "/local/repo", id: "run-route", flatIndex: 0 }, { sessionEnabled: true, watchdogStatus() {} });
@@ -78,12 +83,62 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 		assert.equal("tools" in wire, false); assert.doesNotMatch(JSON.stringify(wire), /remote\.example|\/local\/repo|callback|token/iu);
 		assert.deepEqual(serializeHerdrPiLaunch({ ...clean, remoteResources: { ...clean.remoteResources!, reads: ["remote-only.md"] } }).resources.reads, ["remote-only.md"]);
 		assert.doesNotMatch(JSON.stringify(wire), /LOCAL_SECRET_PROMPT|Users\/local/u);
-		assert.throws(() => serializeHerdrPiLaunch({ ...clean, storage: { kind: "file", sessionFile: "/local/session.jsonl" } }), /fork, resume, or revival/u);
 		assert.throws(() => serializeHerdrPiLaunch({ ...clean, extensionPaths: ["/local/private.ts"] }), /cannot transfer local extension paths/u);
 		assert.doesNotMatch(JSON.stringify(serializeHerdrPiLaunch({ ...clean, hooks: [{ name: "local", factory() {} }] })), /callback|factory|local/u);
 		assert.throws(() => serializeHerdrPiLaunch({ ...clean, runtime: { ...runtime, nestedRoute: { rootRunId: "r", eventSink: "/local/events", controlInbox: "/local/control", capabilityToken: "SECRET" } } }), /Nested delegation/u);
 		assert.throws(() => serializeHerdrPiLaunch({ ...clean, processEnv: { MCP_DIRECT_TOOLS: "local-server" } }), /bindings, MCP selections, or process environment/u);
 		assert.throws(() => serializeHerdrPiLaunch({ ...clean, runtime: { ...runtime, permissions: { rules: { bash: "deny" } } as never } }), /permission rules/u);
+	});
+
+	it("launches a fresh placed child that was given a local session path, and refuses one that would restore a transcript", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "placed-session-"));
+		try {
+			const sessionFile = path.join(root, "run-0", "session.jsonl");
+			const build = () => buildRunnerChildLaunch({ agent: "worker", task: "inspect", machine, cwd: machine.cwd, sessionFile, inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: false }, { cwd: "/local/repo", id: "run-fresh", flatIndex: 0 }, { sessionEnabled: true, watchdogStatus() {} }).session;
+			assert.equal(serializeHerdrPiLaunch(build()).resources.agent, "worker");
+			fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", id: "forked" })}\n`);
+			assert.throws(() => serializeHerdrPiLaunch(build()), /fork, resume, or revival/u);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("launches a placed child whose machine cwd does not exist on this host, foreground and background", async () => {
+		const remoteCwd = path.join(os.tmpdir(), `placed-remote-only-${Date.now().toString(36)}`);
+		const placed = { ...machine, cwd: remoteCwd };
+		const launchedCwds: string[] = [];
+		const factory: ChildSessionFactory = { async create(launch) { launchedCwds.push(launch.cwd); const listeners = new Set<(event: any) => void>(); return { ...child, subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); }, async prompt() { const message = { role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } }; for (const listener of listeners) listener({ type: "message_end", message }); for (const listener of listeners) listener({ type: "agent_settled" }); } }; }, async dispose() {} };
+		const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), "placed-runner-"));
+		try {
+			const foreground = await runSync(process.cwd(), [makeAgent("worker")], "worker", "inspect", { machine: placed, cwd: remoteCwd, acceptance: false, childSessionFactory: factory });
+			assert.equal(foreground.exitCode, 0, foreground.error);
+			const background = await runSingleStepInner({ agent: "worker", task: "inspect", machine: placed, cwd: remoteCwd, context: "fresh", inheritProjectContext: true, inheritGlobalContext: true, inheritSkills: false, waitToolEnabled: false }, { cwd: process.cwd(), id: "placed-remote-cwd", flatIndex: 0, flatStepCount: 1, previousOutput: "", placeholder: "{previous}", outputFile: path.join(outputDir, "output.log"), sessionEnabled: false, childSessions: factory });
+			assert.equal(background.exitCode, 0, background.error);
+			assert.deepEqual(launchedCwds, [remoteCwd, remoteCwd]);
+		} finally {
+			fs.rmSync(outputDir, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses up front to revive a transcript onto a machine", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "placed-revival-"));
+		const runId = `placed-revival-${Date.now().toString(36)}`;
+		try {
+			const sessionFile = path.join(root, "sessions", "run-0", "session.jsonl");
+			const result = executeAsyncSingle(runId, {
+				agent: "worker", task: "Continue", agentConfig: makeAgent("worker", { machine: "workmac" }),
+				ctx: { pi: { events: { emit() {} } }, cwd: root, currentSessionId: "placed-revival" },
+				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+				shareEnabled: false, sessionRoot: path.join(root, "sessions"), maxSubagentDepth: 1,
+				sessionFile,
+				revivalLease: { sessionFile, runId, sourceRunId: "placed-source" },
+			});
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /does not support fork, resume, or revival/u);
+			assert.equal(fs.existsSync(path.join(DIRS.async, runId)), false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("parses literal tagged Herdr 0.9 success envelopes", () => {
@@ -121,6 +176,20 @@ describe("pane-native Herdr placement public contracts", { skip: process.platfor
 	it("does not retry a non-transient start error", async () => { let calls = 0; const connection = { client: { async call() { calls++; throw new Error("permission denied"); } } }, owner = new (HerdrPlacedRunOwner as unknown as new (...args: unknown[]) => HerdrPlacedRunOwner)({ id: "m", target: "host", cwd: "/repo" }, "run", "/tmp/pi-subagents-herdr-owned", connection, () => {}); owner.owned = { workspaceId: "w", tabId: "t", paneId: "pane" }; await assert.rejects(owner.start("codex", "a", []), /permission denied/u); assert.equal(calls, 1); });
 	it("rejects pane drift or occupation after a transient start rejection", async () => { for (const pane of [{ pane_id: "other", workspace_id: "w", tab_id: "t", agent: null }, { pane_id: "pane", workspace_id: "w", tab_id: "t", agent: "other" }]) { let starts = 0; const connection = { client: { async call(method: string) { if (method === "pane.get") return { type: "pane_info", pane }; starts++; throw new Error("is not an available shell"); } } }, owner = new (HerdrPlacedRunOwner as unknown as new (...args: unknown[]) => HerdrPlacedRunOwner)({ id: "m", target: "host", cwd: "/repo" }, "run", "/tmp/pi-subagents-herdr-owned", connection, () => {}); owner.owned = { workspaceId: "w", tabId: "t", paneId: "pane" }; await assert.rejects(owner.start("codex", "a", []), /identity changed|became occupied/u); assert.equal(starts, 1); } });
 	it("deadline rejection leaves ownership unset and cleanup closes the unoccupied pane", async () => { let starts = 0, closes = 0, now = 0, removals = 0; const connection = { client: { async call(method: string) { if (method === "agent.start") { starts++; throw new Error("is not an available shell"); } if (method === "pane.get") return { type: "pane_info", pane: { pane_id: "pane", workspace_id: "w", tab_id: "t", agent: null, agent_session: null } }; if (method === "session.snapshot") return { type: "session_snapshot", snapshot: { agents: [] } }; if (method === "pane.close") { closes++; return {}; } throw new Error(method); } }, async close() {} }, owner = new (HerdrPlacedRunOwner as unknown as new (...args: unknown[]) => HerdrPlacedRunOwner)({ id: "m", target: "host", cwd: "/repo" }, "run", "/tmp/pi-subagents-herdr-owned", connection, () => { removals++; }); owner.owned = { workspaceId: "w", tabId: "t", paneId: "pane" }; await assert.rejects(owner.start("codex", "a", [], { timeoutMs: 20, pollMs: 10, clock: { now: () => now, async wait(ms) { now += ms; } } }), /startup deadline/u); assert.equal(starts, 3); assert.equal(owner.agentName, undefined); await owner.cleanup(true); assert.equal(closes, 1); assert.equal(removals, 1); });
+	it("retries a prompt Herdr refuses because the started agent's name is not registered yet", async () => { const identity = { agentName: "pi-a" } as HerdrRunIdentity; let now = 0; const calls: unknown[] = []; const connection = { client: { async call(method: string, params: unknown) { calls.push([method, params]); if (calls.length === 1) throw new Error("pi-a is not an active named agent"); return {}; } } } as never; await herdrPaneHost.prompt(connection, identity, "/pi-subagents-bridge r1", { clock: { now: () => now, async wait(ms) { now += ms; } } }); assert.deepEqual(calls, [["agent.prompt", { target: "pi-a", text: "/pi-subagents-bridge r1" }], ["agent.prompt", { target: "pi-a", text: "/pi-subagents-bridge r1" }]]); });
+	it("does not retry any other prompt error", async () => { let calls = 0; const connection = { client: { async call() { calls++; throw new Error("permission denied"); } } } as never; await assert.rejects(herdrPaneHost.prompt(connection, { agentName: "pi-a" } as HerdrRunIdentity, "x"), /permission denied/u); assert.equal(calls, 1); });
+	it("gives up on an unregistered agent name at the prompt deadline", async () => { let now = 0, calls = 0; const connection = { client: { async call() { calls++; throw new Error("pi-a is not an active named agent"); } } } as never; await assert.rejects(herdrPaneHost.prompt(connection, { agentName: "pi-a" } as HerdrRunIdentity, "x", { timeoutMs: 300, pollMs: 100, clock: { now: () => now, async wait(ms) { now += ms; } } }), /not an active named agent/u); assert.equal(calls, 4); });
+	it("does not resend a refused task prompt after the run is aborted during the retry wait", async () => {
+		const identity = { agentName: "pi-a", nativeSessionId: "native" } as HerdrRunIdentity; const sent: string[] = []; let now = 0, session!: HerdrPiSession;
+		const connection = { client: { async call(_method: string, params: { text: string }) { sent.push(params.text); if (sent.length === 1) throw new Error("pi-a is not an active named agent"); if (sent.length > 2) throw new Error("task prompt resent after abort"); return {}; } } };
+		const clock = { now: () => now, async wait(ms: number) { now += ms; await session.abort(); } };
+		const host = { ...herdrPaneHost, prompt: (c: never, i: HerdrRunIdentity, text: string, options?: object) => herdrPaneHost.prompt(c, i, text, { ...options, clock }) };
+		const bridge = { failure: new Promise<never>(() => {}), failed: false, adopt: () => [], prepare: async () => ({}), close() {} } as unknown as BridgeChannel;
+		session = new HerdrPiSession({ identity, connection, host, async cleanup() {} } as unknown as HerdrPlacedRunOwner, { async close() {} }, bridge, undefined, undefined, runtime);
+		await assert.rejects(session.prompt("task"), /not sent because the run was stopped/u);
+		assert.equal(sent.length, 2);
+		assert.notEqual(sent[1], sent[0]);
+	});
 
 	it("resolves agent instructions, skills, memory, and refinements from a distinct remote fixture", () => {
 		const remote = fs.mkdtempSync(path.join(os.tmpdir(), "pi-herdr-remote-resources-")); fs.mkdirSync(path.join(remote, ".git"));

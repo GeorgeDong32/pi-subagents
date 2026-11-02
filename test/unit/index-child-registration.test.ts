@@ -520,6 +520,42 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
+	it("registers no slash commands or shortcut when enableSlashCommands is false, and keeps the subagent tool", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const registered = { tools: [], commands: [], shortcuts: [] };
+			const fakePi = new Proxy({
+				events: { on() { return () => {}; }, emit() {} },
+				registerTool(tool) { registered.tools.push(tool.name); },
+				registerCommand(name) { registered.commands.push(name); },
+				registerShortcut(key) { registered.shortcuts.push(key); },
+				registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			registerSubagentExtension(fakePi);
+			process.stdout.write(JSON.stringify(registered));
+		`;
+		const register = (config: object) => {
+			const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-slash-commands-config-"));
+			try {
+				const configDir = path.join(agentDir, "extensions", "subagent");
+				fs.mkdirSync(configDir, { recursive: true });
+				fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ foregroundDetachShortcut: "ctrl+alt+d", ...config }), "utf-8");
+				const output = execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(agentDir), encoding: "utf-8" });
+				return JSON.parse(output) as { tools: string[]; commands: string[]; shortcuts: string[] };
+			} finally {
+				fs.rmSync(agentDir, { recursive: true, force: true });
+			}
+		};
+		const defaults = register({});
+		assert.ok(defaults.commands.includes("run") && defaults.commands.includes("subagents-watchdog") && defaults.commands.includes("prompt-workflow"));
+		assert.deepEqual(defaults.shortcuts, ["ctrl+alt+d"]);
+		const disabled = register({ enableSlashCommands: false });
+		assert.deepEqual(disabled.commands, []);
+		assert.deepEqual(disabled.shortcuts, []);
+		assert.deepEqual(disabled.tools, defaults.tools);
+		assert.ok(disabled.tools.includes("subagent"));
+	});
+
 	it("yields registered root bg_wait for an owned nested supervisor request", () => {
 		const script = String.raw`
 			import assert from "node:assert/strict";
@@ -1331,6 +1367,7 @@ describe("subagent extension child mode", () => {
 			import { spawn } from "node:child_process";
 			import registerSubagentExtension from "./index.ts";
 			import { DIRS } from "./src/shared/types.ts";
+			import { updateActiveRunIndex } from "./src/runs/background/active-run-index.ts";
 			const fail = (message) => { throw new Error(message); };
 			const makePi = () => {
 				const handlers = new Map();
@@ -1348,9 +1385,13 @@ describe("subagent extension child mode", () => {
 			const sessions = path.join(process.env.PI_CODING_AGENT_DIR, "sessions");
 			fs.mkdirSync(sessions, { recursive: true });
 			const sessionFile = (name) => { const file = path.join(sessions, name + ".jsonl"); fs.writeFileSync(file, ""); return file; };
-			const [a, b, foreign, fresh, childSession] = ["a", "b", "foreign", "fresh", "child"].map(sessionFile);
+			const [a, b, foreign, fresh, childSession, x, y, z] = ["a", "b", "foreign", "fresh", "child", "x", "y", "z"].map(sessionFile);
 			const ctxFor = (file) => ({ cwd: process.cwd(), isIdle() { return false; }, hasUI: false, ui: { setWidget() {}, requestRender() {}, theme: { fg(_name, text) { return text; }, bg(_name, text) { return text; }, bold(text) { return text; } } }, sessionManager: { getSessionId() { return path.basename(file); }, getSessionFile() { return file; }, getEntries() { return []; } }, modelRegistry: { getAvailable() { return []; } } });
 			const sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+			const keeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+			// pi-web's liveness registry: a session counts as busy while its provider says so.
+			const liveness = new Map();
+			globalThis[Symbol.for("@agegr/pi-web/session-liveness/v1")] = { version: 1, register(provider) { liveness.set(provider.sessionId, provider); return () => liveness.delete(provider.sessionId); } };
 			const stamp = Date.now();
 			const runs = [];
 			const writeRun = (name, status) => {
@@ -1364,6 +1405,9 @@ describe("subagent extension child mode", () => {
 			const done = writeRun("done", { sessionId: a, state: "complete", steps: [{ agent: "worker", status: "complete", sessionFile: childSession }] });
 			const otherLive = writeRun("foreign-live", { sessionId: foreign, state: "running", pid: sleeper.pid, steps: [{ agent: "worker", status: "running" }] });
 			const otherDone = writeRun("foreign-done", { sessionId: foreign, state: "complete", steps: [{ agent: "worker", status: "complete", sessionFile: childSession }] });
+			const kept = writeRun("kept", { sessionId: a, state: "running", pid: keeper.pid, steps: [{ agent: "worker", status: "running" }] });
+			updateActiveRunIndex(path.join(DIRS.async, kept), "running");
+			const chainDone = writeRun("chain-done", { sessionId: x, state: "complete", steps: [{ agent: "worker", status: "complete", sessionFile: childSession }] });
 			// Registered tools throw on error results; both outcomes are compared as text.
 			const call = async (tool, params, ctx) => {
 				try {
@@ -1390,7 +1434,35 @@ describe("subagent extension child mode", () => {
 				expect(await subagent({ action: "status", id: otherDone }), notOwned, "other session status");
 				expect(await subagent({ action: "stop", id: otherLive }), /was not found in the active session/, "other session stop");
 				expect(await subagent({ action: "stop", id: live }), /Stop requested for async run/, "stop");
+				if (!liveness.get("b.jsonl")?.isActive()) fail("successor is not busy with the replaced session's running run");
+				// pi-web reopens a forked-from session in the same process while its fork stays live.
+				const reopened = makePi();
+				const ctxA = ctxFor(a);
+				await emit(reopened, "session_start", { reason: "startup" }, ctxA);
+				expect(await call(reopened.tools.get("subagent"), { action: "status", id: done }, ctxA), new RegExp('Revive: subagent\\(\\{ action: "resume", id: "' + done), "reopened session owns its run");
+				expect(await subagent({ action: "status", id: done }), notOwned, "successor gives up the reopened session's run");
+				// The successor stops tracking the reopened session's running run on its next liveness sweep.
+				for (let i = 0; i < 80 && liveness.get("b.jsonl")?.isActive(); i += 1) await new Promise((resolve) => setTimeout(resolve, 100));
+				if (liveness.get("b.jsonl")?.isActive()) fail("successor still tracks " + kept + " after its session reopened");
+				await emit(reopened, "session_shutdown", { reason: "quit" });
 				await emit(second, "session_shutdown", { reason: "quit" });
+				// x replaced by y, y by z; reopening y leaves x's runs with z alone.
+				const px = makePi();
+				await emit(px, "session_start", { reason: "startup" }, ctxFor(x));
+				await emit(px, "session_shutdown", { reason: "new" });
+				const py = makePi();
+				await emit(py, "session_start", { reason: "new", previousSessionFile: x }, ctxFor(y));
+				await emit(py, "session_shutdown", { reason: "new" });
+				const pz = makePi();
+				const ctxZ = ctxFor(z);
+				await emit(pz, "session_start", { reason: "new", previousSessionFile: y }, ctxZ);
+				const reopenedY = makePi();
+				const ctxY = ctxFor(y);
+				await emit(reopenedY, "session_start", { reason: "startup" }, ctxY);
+				expect(await call(pz.tools.get("subagent"), { action: "status", id: chainDone }, ctxZ), new RegExp('Revive: subagent\\(\\{ action: "resume", id: "' + chainDone), "latest successor keeps the earliest session's run");
+				expect(await call(reopenedY.tools.get("subagent"), { action: "status", id: chainDone }, ctxY), notOwned, "reopened middle session gives up what it had inherited");
+				await emit(reopenedY, "session_shutdown", { reason: "quit" });
+				await emit(pz, "session_shutdown", { reason: "quit" });
 				const third = makePi();
 				const ctxFresh = ctxFor(fresh);
 				await emit(third, "session_start", { reason: "startup" }, ctxFresh);
@@ -1398,6 +1470,7 @@ describe("subagent extension child mode", () => {
 				await emit(third, "session_shutdown", { reason: "quit" });
 			} finally {
 				sleeper.kill();
+				keeper.kill();
 				for (const runId of runs) fs.rmSync(path.join(DIRS.async, runId), { recursive: true, force: true });
 			}
 		`;
@@ -1408,10 +1481,11 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
-	it("keeps view-only slash reports visible but excludes new ones from every model request", () => {
+	it("excludes view-only slash reports from model requests and marks other pi-subagents messages as automated, leaving system messages in place", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "slash-context-agent-"));
 		const script = String.raw`
 			import assert from "node:assert/strict";
+			import { ExtensionRunner } from "@earendil-works/pi-coding-agent";
 			import registerSubagentExtension from "./index.ts";
 			const handlers = new Map();
 			const commands = new Map();
@@ -1445,25 +1519,32 @@ describe("subagent extension child mode", () => {
 			const unrelated = { role: "custom", customType: "other-extension", content: "Keep this", timestamp: 4 };
 			const assistant = { role: "assistant", content: [{ type: "text", text: "subagent-slash-text-result" }], timestamp: 5 };
 			const historical = { role: "custom", customType: "subagent-slash-text-result", content: "Report stored before the update", display: true, timestamp: 0 };
-			const messages = [historical, report, user, workResult, unrelated, assistant, { ...report, content: "Second report" }];
-			async function modelContext(input) {
-				let current = input;
-				for (const handler of handlers.get("context") ?? []) {
-					const result = await handler({ type: "context", messages: current }, ctx);
-					if (result?.messages) current = result.messages;
-				}
-				return current;
-			}
-			// upstream v0.82: model-visible pi-subagents custom messages carry an
-			// automated-origin notice marker (prompt-injection hygiene)
-			const wrap = (m) => ({ ...m, content: '<pi_subagents_notice type="' + m.customType + '" origin="automated message from the pi-subagents extension, not typed by the user">\n' + m.content + '\n</pi_subagents_notice>' });
-			const expected = [wrap(historical), user, wrap(workResult), unrelated, assistant];
+			const notify = { role: "custom", customType: "subagent-notify", content: "Background task completed: **worker**\n\nParent action: review", display: true, details: { runs: [] }, timestamp: 6 };
+			const image = { type: "image", data: "aGk=", mimeType: "image/png" };
+			const partsNotice = { role: "custom", customType: "subagent-wait-subscription", content: [{ type: "text", text: "Run finished" }, image], display: true, timestamp: 7 };
+			// A mid-conversation system message must stay where it is, or the cached prefix ends at the tools.
+			const leading = { role: "system", content: "Base prompt", timestamp: 0 };
+			const sectionUpdate = { role: "system", content: "", sections: { time: "Now: 10:00" }, timestamp: 5 };
+			const messages = [leading, historical, report, user, workResult, unrelated, assistant, sectionUpdate, { ...report, content: "Second report" }, notify, partsNotice];
+			const runner = new ExtensionRunner([{ path: "pi-subagents", handlers }], {}, process.cwd(), undefined, undefined);
+			const modelContext = (input) => runner.emitContext(input);
+			const open = (type) => '<pi_subagents_notice type="' + type + '" origin="automated message from the pi-subagents extension, not typed by the user">';
+			const close = "</pi_subagents_notice>";
+			const expected = [
+				leading,
+				{ ...historical, content: open("subagent-slash-text-result") + "\nReport stored before the update\n" + close },
+				user,
+				{ ...workResult, content: open("subagent-slash-result") + "\nWorker finished\n" + close },
+				unrelated,
+				assistant,
+				sectionUpdate,
+				{ ...notify, content: open("subagent-notify") + "\nBackground task completed: **worker**\n\nParent action: review\n" + close },
+				{ ...partsNotice, content: [{ type: "text", text: open("subagent-wait-subscription") + "\n" }, { type: "text", text: "Run finished" }, image, { type: "text", text: "\n" + close }] },
+			];
 			assert.deepEqual(await modelContext(messages), expected);
-			assert.deepEqual(await modelContext(messages), expected, "persisted reports stay excluded on later requests and resume");
-			assert.equal(messages.length, 7, "filtering must not mutate the stored transcript");
+			assert.equal(JSON.stringify(await modelContext(messages)), JSON.stringify(expected), "every request renders the same history bytes");
 			assert.deepEqual(await modelContext([]), []);
-			// (upstream v0.82 wraps model-visible notices non-idempotently — feeding the
-			// wrapped array back re-wraps by design, so the old pass-through check is gone)
+			assert.deepEqual(await modelContext([user, unrelated, assistant]), [user, unrelated, assistant]);
 		`;
 		try {
 			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(agentDir), stdio: "pipe" });
@@ -1576,7 +1657,7 @@ describe("subagent extension child mode", () => {
 		assert.deepEqual(output.entryTypes, ["subagent_supervisor_reply", "subagent_watchdog_warning"]);
 		for (const [type, lines] of [...output.blocks.messages, ...output.blocks.entries]) {
 			assert.equal(lines.length, 1, type);
-			assert.match(lines[0]!, /^  ⎿  .+ \(ctrl\+o to expand\)$/, type);
+			assert.match(lines[0]!, /^ \[subagent\] .+ \(click to expand\)$/, type);
 		}
 	});
 
@@ -1763,44 +1844,5 @@ describe("subagent extension child mode", () => {
 			],
 			{ cwd: projectRoot, stdio: "pipe" },
 		);
-	});
-
-	it("registers no slash commands or shortcut when enableSlashCommands is false, and keeps the subagent tool", () => {
-		const script = String.raw`
-			import registerSubagentExtension from "./index.ts";
-			const registered = { tools: [], commands: [], shortcuts: [] };
-			const fakePi = new Proxy({
-				events: { on() { return () => {}; }, emit() {} },
-				registerTool(tool) { registered.tools.push(tool.name); },
-				registerCommand(name) { registered.commands.push(name); },
-				registerShortcut(key) { registered.shortcuts.push(key); },
-				registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; },
-			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
-			registerSubagentExtension(fakePi);
-			process.stdout.write(JSON.stringify(registered));
-		`;
-		const register = (config: object) => {
-			const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-slash-commands-config-"));
-			try {
-				const configDir = path.join(agentDir, "extensions", "subagent");
-				fs.mkdirSync(configDir, { recursive: true });
-				fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ foregroundDetachShortcut: "ctrl+alt+d", ...config }), "utf-8");
-				const output = execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(agentDir), encoding: "utf-8" });
-				return JSON.parse(output) as { tools: string[]; commands: string[]; shortcuts: string[] };
-			} finally {
-				fs.rmSync(agentDir, { recursive: true, force: true });
-			}
-		};
-		const defaults = register({});
-		// surface-tuning whitelist: run + the subagents-* family; prompt-workflow is
-		// not a fork command, and the detach shortcut is not registered
-		assert.ok(defaults.commands.includes("run") && defaults.commands.includes("subagents-watchdog"));
-		assert.deepEqual(defaults.commands, ["subagents-watchdog", "run", "subagent-cost", "subagents-detach", "subagents-stop", "subagents-steer"]);
-		assert.deepEqual(defaults.shortcuts, ["ctrl+alt+d"]);
-		const disabled = register({ enableSlashCommands: false });
-		assert.deepEqual(disabled.commands, []);
-		assert.deepEqual(disabled.shortcuts, []);
-		assert.deepEqual(disabled.tools, defaults.tools);
-		assert.ok(disabled.tools.includes("subagent"));
 	});
 });
